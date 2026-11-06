@@ -1,0 +1,9 @@
+# Downloaded binaries
+/bin/adb
+/bin/gost
+/bin/*.zip
+/bin/*.tar.gz
+
+# Runtime files
+*.log
+.DS_Store

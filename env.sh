@@ -1,0 +1,11 @@
+# Source this in a shell that should send traffic through the phone:
+#   source "$HOME/.local/share/z-connect/env.sh"
+export ZCONNECT_PORT="${ZCONNECT_PORT:-1080}"
+export ALL_PROXY="socks5h://127.0.0.1:${ZCONNECT_PORT}"
+export all_proxy="$ALL_PROXY"
+export http_proxy="$ALL_PROXY"
+export https_proxy="$ALL_PROXY"
+export HTTP_PROXY="$ALL_PROXY"
+export HTTPS_PROXY="$ALL_PROXY"
+export NO_PROXY="localhost,127.0.0.1,::1"
+export no_proxy="$NO_PROXY"

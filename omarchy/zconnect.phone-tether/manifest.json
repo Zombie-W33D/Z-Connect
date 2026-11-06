@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "zconnect.phone-tether",
+  "name": "Z-Connect",
+  "version": "1.0.0",
+  "author": "Z-Connect contributors",
+  "license": "MIT",
+  "description": "Phone mobile data over USB/ADB, with a Connect/Disconnect panel and live connection details.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Z-Connect",
+    "description": "Bring up the phone's mobile data over USB without Android's tethering stack.",
+    "category": "Network",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}

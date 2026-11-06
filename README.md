@@ -24,7 +24,7 @@ phone mobile data ──► internet
 ```
 
 > **Status:** working reference implementation. Linux desktop + Android phone
-> over USB/ADB. Tested with an ARM64 Android 12 phone and an Omarchy/Quickshell
+> over USB/ADB. Tested with an ARM64 Android phone and an Omarchy/Quickshell
 > desktop. Not affiliated with PdaNet.
 
 ---

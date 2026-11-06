@@ -162,6 +162,9 @@ omarchy plugin enable zconnect.phone-tether --section right
 omarchy bar move zconnect.phone-tether --after omarchy.network
 ```
 
+If you already have an older local copy of this widget under a different plugin
+ID, disable it first so you do not end up with two phone icons.
+
 ---
 
 ## Usage

@@ -13,6 +13,7 @@ FORCE=0
 [[ "${1:-}" == "--force" ]] && FORCE=1
 
 GOST_VERSION="${GOST_VERSION:-v3.3.3}"
+GOST_VERSION="v${GOST_VERSION#v}"
 GOST_ASSET="${GOST_ASSET:-gost_${GOST_VERSION#v}_linux_arm64.tar.gz}"
 GOST_URL="https://github.com/go-gost/gost/releases/download/${GOST_VERSION}/${GOST_ASSET}"
 CHECKSUMS_URL="https://github.com/go-gost/gost/releases/download/${GOST_VERSION}/checksums.txt"

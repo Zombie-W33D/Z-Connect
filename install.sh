@@ -22,7 +22,7 @@ if [[ "$SRC" != "$DEST" ]]; then
   # Copy the runtime files. bin binaries are copied when present; otherwise
   # fetch-deps.sh downloads them after installation.
   cp -a "$SRC"/connect.sh "$SRC"/disconnect.sh "$SRC"/status.sh \
-        "$SRC"/env.sh "$SRC"/lib.sh "$SRC"/fetch-deps.sh \
+        "$SRC"/proxy.sh "$SRC"/env.sh "$SRC"/lib.sh "$SRC"/fetch-deps.sh \
         "$SRC"/chromium-zconnect.sh "$SRC"/brave-zconnect.sh \
         "$SRC"/README.md "$SRC"/LICENSE "$DEST"/
   mkdir -p "$DEST/docs" "$DEST/bin" "$DEST/omarchy"

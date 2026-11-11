@@ -71,10 +71,25 @@ echo "[5/5] Forwarding port ${PORT} over USB..."
 echo
 echo "Testing the tunnel..."
 if IP="$(curl -fsS --socks5-hostname "127.0.0.1:${PORT}" --max-time 20 https://api.ipify.org 2>/dev/null)"; then
+  SYSTEM_PROXY="off"
+  if [[ "${ZCONNECT_AUTO_PROXY:-1}" != "0" && -x "$HERE/proxy.sh" ]]; then
+    if PROXY_OUTPUT="$("$HERE/proxy.sh" enable 2>&1)"; then
+      SYSTEM_PROXY="on"
+    else
+      echo
+      echo "warning: the tunnel is up, but the system proxy was not enabled:" >&2
+      printf '%s\n' "$PROXY_OUTPUT" | sed 's/^/  /' >&2
+    fi
+  fi
+
   echo
   echo "Connected."
   echo "  SOCKS5 proxy : 127.0.0.1:${PORT}"
   echo "  Phone egress : ${IP}"
+  echo "  System proxy : ${SYSTEM_PROXY}"
+  if [[ "$SYSTEM_PROXY" == "on" ]]; then
+    echo "  Note         : restart apps that were already open (Brave, etc.)"
+  fi
   echo
   echo "Browser test   : $HERE/chromium-zconnect.sh"
   echo "Terminal apps  : source $HERE/env.sh"

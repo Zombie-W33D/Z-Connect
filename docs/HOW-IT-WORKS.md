@@ -161,13 +161,15 @@ Responsibilities:
 5. Kill any previous `zconnect-gost` process and start a fresh one.
 6. Recreate the `adb` forward.
 7. Test the tunnel through `https://api.ipify.org` and print the egress IP.
+8. Enable the user-level system proxy unless `ZCONNECT_AUTO_PROXY=0`.
 
 The script is idempotent: running it repeatedly is safe.
 
 ### `disconnect.sh`
 
-Kills `zconnect-gost` on the phone and removes the port forward. It leaves the
-desktop's own networking untouched.
+Restores the previous system-proxy settings first (this works even if the cable
+is already gone), then kills `zconnect-gost` on the phone and removes the port
+forward. It leaves the rest of the desktop's networking untouched.
 
 ### `status.sh`
 
@@ -175,8 +177,25 @@ Emits `key=value` lines. Quick mode only inspects `adb` state, the forward, and
 the phone-side process. `--full` additionally makes one request through the
 proxy to confirm end-to-end connectivity and retrieve the phone's egress IP.
 
+It also emits `system_proxy`, `system_proxy_managed`, `system_proxy_mode`,
+`system_proxy_socks`, and `system_proxy_error` before the phone checks, so the
+panel can restore a proxy left behind after a crash or cable pull.
+
 The script deliberately exits 0 even when the phone is missing, because the bar
 widget polls it.
+
+### `proxy.sh`
+
+Manages the optional user-level system proxy:
+
+- `status` prints the current state and whether Z-Connect owns it;
+- `enable` saves the current settings, then sets the GNOME/GIO manual SOCKS
+  proxy and the Hyprland session environment;
+- `disable` restores the saved settings;
+- `cleanup` restores them only when the phone tunnel is no longer up.
+
+The backup lives in `~/.local/state/zconnect/proxy-backup.env`; a marker and a
+lock file live next to it. No root is required.
 
 ### Omarchy widget
 
@@ -187,7 +206,8 @@ The widget is a single `Panel.qml` registered as a bar widget. It:
 - runs `connect.sh` / `disconnect.sh` as child processes;
 - shows the latest error output if an action fails;
 - exposes IPC methods (`open`, `close`, `toggle`, `connect`, `disconnect`,
-  `refresh`, `status`) so it can be driven by a hotkey.
+  `proxyOn`, `proxyOff`, `proxyToggle`, `proxyStatus`, `refresh`, `status`) so
+  it can be driven by a hotkey.
 
 It does not need local internet because the only network request it triggers is
 the `--full` status probe through the phone proxy.
@@ -228,14 +248,101 @@ ZCONNECT_DNS="9.9.9.9:53,1.1.1.1:53" ./connect.sh
 
 ---
 
-## 7. Lifecycle and persistence
+## 7. User-level system proxy
+
+SOCKS5 only helps apps that know to use it. `proxy.sh` bridges that gap without
+root by changing per-user settings in two places:
+
+1. **GNOME/GIO settings.** Apps that use GLib's proxy resolver read
+   `org.gnome.system.proxy`. `proxy.sh` sets the mode to `manual`, points the
+   SOCKS host at `127.0.0.1` and the configured port, and merges private ranges
+   into `ignore-hosts`.
+2. **Session environment for new processes.** Hyprland can set the environment
+   for future launches with `hl.env(...)`. The script also updates the systemd
+   user environment and the D-Bus activation environment so services started
+   later inherit the same values.
+
+The environment variables are deliberately narrow:
+
+```text
+SOCKS_SERVER=127.0.0.1:1080
+SOCKS_VERSION=5
+NO_PROXY=localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,.local
+no_proxy=<same>
+```
+
+### Why the traditional proxy variables are cleared
+
+Chromium and Electron read `http_proxy`, `https_proxy`, and `all_proxy` and treat
+them as **HTTP** proxies. A SOCKS5 relay at that address does not speak HTTP, so
+Brave/Chromium fails with `ERR_EMPTY_RESPONSE` when those variables are present.
+Chromium's own SOCKS variables are `SOCKS_SERVER` and `SOCKS_VERSION`.
+
+`proxy.sh` therefore saves and clears both the lowercase and uppercase
+traditional variables while the system proxy is on, and restores them on
+disable. This is what makes the system proxy work with Brave/Chromium.
+
+Terminal tools that need the traditional variables can still use
+`source env.sh` or `curl --socks5-hostname`. Do not launch Chromium from a shell
+that has `env.sh` sourced; the system proxy and the launcher scripts are the
+supported paths for browsers.
+
+### Saved state and failure handling
+
+Before changing anything, `proxy.sh enable` saves:
+
+- the previous `gsettings` mode, SOCKS host/port, and ignore-hosts;
+- whether each managed environment variable was set, and its value.
+
+The backup is `~/.local/state/zconnect/proxy-backup.env`. A marker file
+(`proxy-active`) and a lock file (`proxy.lock`) live in the same directory,
+which is created with mode `700`. The lock uses `flock` so a panel toggle and a
+script cannot apply settings at the same time.
+
+`enable` first checks the tunnel through the SOCKS proxy. It applies the
+`gsettings` values, then the environment, and sets `mode=manual` last so a
+partial failure does not cut the desktop over to a dead proxy. If applying the
+settings fails, it restores the backup immediately.
+
+`disable` restores the saved settings and removes the backup. If there is no
+backup, it only clears settings that still point at Z-Connect's own endpoint, so
+it does not stomp on an unrelated proxy configuration.
+
+`cleanup` is the crash-recovery path. It checks whether the tunnel is still up;
+if the forward or the phone-side process is gone, it calls `disable`. The
+Omarchy panel calls `cleanup` whenever `status.sh` reports
+`system_proxy_managed=yes` while the tunnel is down. That is what prevents a
+stale SOCKS proxy from making the desktop look offline after the phone is
+unplugged.
+
+### Automatic behavior
+
+- `connect.sh` enables the system proxy after a successful tunnel test unless
+  `ZCONNECT_AUTO_PROXY=0`.
+- `disconnect.sh` restores the previous settings before stopping the tunnel, so
+  it still works when the cable has already been pulled.
+- The panel's **System proxy** toggle can turn it on or off independently while
+  the tunnel is up.
+
+### Limits
+
+This is a user-level proxy, not a VPN. It does not change routes, and it cannot
+capture an app that ignores both `gsettings` and the Chromium SOCKS variables.
+Apps that were already running must be restarted to inherit the environment.
+On a non-GNOME desktop without Hyprland, fewer apps will see the change; the
+browser launchers and explicit proxy settings remain the fallback.
+
+---
+
+## 8. Lifecycle and persistence
 
 | Event | What survives | What breaks |
 | --- | --- | --- |
 | Desktop reboot | Phone-side gost may still run; `bin/` files | `adb` server and forward are gone |
 | Unplug/replug phone | Phone-side gost may still run | `adb` forward is gone |
+| Unplug while system proxy is on | The saved proxy backup | The panel/`proxy.sh cleanup` restores the previous proxy settings |
 | Phone reboot | Nothing on the phone side | `gost` process and forward are gone |
-| `disconnect.sh` | Binaries and scripts | gost process and forward are gone |
+| `disconnect.sh` | Binaries and scripts | gost process and forward are gone; previous proxy settings are restored |
 | `adb kill-server` | Phone-side gost | Forward is gone |
 
 In all cases, run `./connect.sh` again. It re-pushes gost only if missing and
@@ -243,7 +350,7 @@ recreates the forward.
 
 ---
 
-## 8. Security analysis
+## 9. Security analysis
 
 ### What is exposed
 
@@ -284,11 +391,12 @@ The repo intentionally excludes:
 
 `bin/adb`, `bin/gost`, archives, and logs are in `.gitignore`. Runtime status
 does display carrier/model/battery and the phone egress IP; review those before
-sharing a screenshot.
+sharing a screenshot. The system-proxy backup in `~/.local/state/zconnect/` is
+outside the repository and contains only the desktop's previous proxy settings.
 
 ---
 
-## 9. Alternatives considered
+## 10. Alternatives considered
 
 ### Android USB tethering (RNDIS)
 
@@ -308,9 +416,10 @@ desktop cannot use it.
 
 ### `tun2socks` / `redsocks` on the desktop
 
-Useful for system-wide routing, but requires root and more moving parts. The
-SOCKS5 proxy is enough for browsers and most CLI tools, and it can be combined
-with these tools later if system-wide routing is needed.
+Useful for transparent whole-desktop routing, but requires root and more moving
+parts. Z-Connect's user-level system proxy covers GNOME/GIO apps and
+Chromium-based apps without root; these tools remain the option for apps that
+ignore both, or when every packet must be captured.
 
 ### SSH reverse tunnel
 
@@ -319,11 +428,12 @@ standard on Android) and more setup. `gost` + `adb` is lighter.
 
 ---
 
-## 10. Design trade-offs
+## 11. Design trade-offs
 
 | Choice | Benefit | Cost |
 | --- | --- | --- |
 | SOCKS5 instead of a TUN device | No root; simple; works with common apps | Per-app configuration; not system-wide |
+| User-level system proxy | No root; GNOME/GIO and Chromium apps work | Not a VPN; already-open apps need a restart; apps with their own proxy config may ignore it |
 | gost on the phone | Avoids tethering stack; static binary | Must match phone ABI; process must be started over ADB |
 | `adb forward` | No extra network listener; USB-only | Forward does not survive unplug/reboot |
 | Remote DNS | Works with no desktop DNS | Requires `socks5h`-aware clients |
@@ -332,7 +442,7 @@ standard on Android) and more setup. `gost` + `adb` is lighter.
 
 ---
 
-## 11. Failure modes and diagnostics
+## 12. Failure modes and diagnostics
 
 | Failure | Where to look |
 | --- | --- |
@@ -342,6 +452,8 @@ standard on Android) and more setup. `gost` + `adb` is lighter.
 | Port conflict | `ss -ltnp | grep 1080`; change `ZCONNECT_PORT` |
 | Proxy up, DNS fails | Set `ZCONNECT_DNS`; test with `curl --socks5-hostname` |
 | Proxy up, phone has no data | Check mobile data toggle and signal |
-| Browser ignores proxy | Use `chromium-zconnect.sh` or configure the app explicitly |
+| System proxy on, app still direct | Restart the app; check `./proxy.sh status` and the gsettings values |
+| No internet after unplugging the phone | Run `./proxy.sh cleanup` or `./proxy.sh disable`; the panel also does this |
+| Browser ignores system proxy | Use `chromium-zconnect.sh` or configure the app explicitly |
 
 More detail: [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).

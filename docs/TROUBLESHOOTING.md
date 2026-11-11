@@ -149,26 +149,89 @@ source ./env.sh
 
 ## Connected, but the browser still uses the normal connection
 
-Not every application honors proxy variables. Options:
+First check whether the system proxy is on:
 
-- Use the included launcher:
+```bash
+cd ~/.local/share/z-connect
+./proxy.sh status
+gsettings get org.gnome.system.proxy mode
+gsettings get org.gnome.system.proxy.socks host
+gsettings get org.gnome.system.proxy.socks port
+```
 
-  ```bash
-  ./chromium-zconnect.sh
-  ./brave-zconnect.sh
-  ```
+If `system_proxy=on` but the browser was already open, **restart the browser**.
+Already-running apps keep the environment they started with. New apps launched
+after the proxy is enabled inherit `SOCKS_SERVER`/`SOCKS_VERSION`.
 
-- Configure the application's proxy setting manually to
-  `socks5://127.0.0.1:1080` (or `socks5h://` if the app supports remote DNS).
+If the browser still ignores it, use the included launcher:
 
-- Use a test that definitely honors the proxy:
+```bash
+./chromium-zconnect.sh
+./brave-zconnect.sh
+```
 
-  ```bash
-  curl --socks5-hostname 127.0.0.1:1080 https://api.ipify.org
-  ```
+Or configure the application's proxy setting manually to
+`socks5://127.0.0.1:1080` (or `socks5h://` if the app supports remote DNS).
+
+Do **not** launch Brave/Chromium from a shell that has `env.sh` sourced. That
+sets the traditional `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` variables, which
+Chromium interprets as HTTP proxies and fails against the SOCKS5 relay. Use the
+system proxy or the launcher for browsers.
+
+Use a test that definitely honors the proxy:
+
+```bash
+curl --socks5-hostname 127.0.0.1:1080 https://api.ipify.org
+```
 
 If that `curl` works, the tunnel is fine and the problem is the app's proxy
 configuration.
+
+---
+
+## No internet after unplugging the phone (stale system proxy)
+
+If the desktop cannot reach the internet after the phone is gone, the system
+proxy may still be pointing at the dead tunnel. Restore it:
+
+```bash
+cd ~/.local/share/z-connect
+./proxy.sh cleanup
+# or force it:
+./proxy.sh disable
+```
+
+`cleanup` only acts when the tunnel is down, so it is safe to run at any time.
+`disable` restores the saved settings unconditionally.
+
+Check the result:
+
+```bash
+./proxy.sh status
+gsettings get org.gnome.system.proxy mode
+```
+
+The panel does this automatically when it sees `system_proxy_managed=yes` while
+the tunnel is down. If it does not, open the panel and press **Refresh**, or run
+the commands above.
+
+---
+
+## The System proxy toggle is greyed out
+
+The toggle is disabled until the tunnel is up. Connect first. If the tunnel is
+up but the toggle stays disabled, refresh the panel or run:
+
+```bash
+./status.sh --quick
+```
+
+Look for `forward=yes` and a non-empty `gost_pid`. If either is missing, the
+panel does not consider the tunnel usable.
+
+If `system_proxy_error` is non-empty, the desktop could not read or write the
+GNOME proxy settings. The environment part may still work for Chromium, but
+install `gsettings`/`dconf` or use the browser launcher on a non-GNOME desktop.
 
 ---
 
@@ -213,9 +276,11 @@ If the phone rebooted, the process is gone too; `connect.sh` starts it again.
 
 ## Everything works, but I need system-wide routing
 
-Z-Connect is a SOCKS5 proxy, not a VPN. To route the entire desktop, you need
-root and a TUN device or transparent proxy. Options include `tun2socks` or
-`redsocks` + iptables. That is outside the scope of this project.
+Z-Connect includes a user-level system proxy for GNOME/GIO apps and
+Chromium-based apps, but it is not a VPN. To route every packet on the desktop,
+including apps that ignore proxy settings, you need root and a TUN device or
+transparent proxy. Options include `tun2socks` or `redsocks` + iptables. That is
+outside the scope of this project.
 
 ---
 
@@ -224,6 +289,10 @@ root and a TUN device or transparent proxy. Options include `tun2socks` or
 ```bash
 cd ~/.local/share/z-connect
 ./status.sh --full
+./proxy.sh status
+gsettings get org.gnome.system.proxy mode
+gsettings get org.gnome.system.proxy.socks host
+gsettings get org.gnome.system.proxy.socks port
 adb devices
 adb forward --list
 adb shell cat /data/local/tmp/zconnect-gost.log

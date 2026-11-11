@@ -28,6 +28,7 @@ Panel {
   readonly property string statusScript: scriptDir + "/status.sh"
   readonly property string connectScript: scriptDir + "/connect.sh"
   readonly property string disconnectScript: scriptDir + "/disconnect.sh"
+  readonly property string proxyScript: scriptDir + "/proxy.sh"
 
   // ------------------------------------------------------------------ theme
   readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
@@ -41,12 +42,17 @@ Panel {
   // ------------------------------------------------------------------ state
   property var details: ({})
   property string action: ""            // "" | "connect" | "disconnect"
+  property string proxyAction: ""       // "" | "enable" | "disable"
   property string errorText: ""
   property string statusError: ""
   property string actionStdout: ""
   property string actionStderr: ""
+  property string proxyStdout: ""
+  property string proxyStderr: ""
+  property bool cleanupRunning: false
 
   readonly property bool busy: action !== ""
+  readonly property bool proxyBusy: proxyAction !== ""
 
   readonly property string adbState: String(details.adb_state || "disconnected")
   readonly property bool phonePresent: adbState === "device"
@@ -56,6 +62,10 @@ Panel {
   readonly property bool internetBad: details.proxy === "no"
   // Quick polls do not test the proxy, so "unknown" still counts as up.
   readonly property bool connected: tunnelUp && !internetBad
+
+  readonly property bool systemProxyOn: details.system_proxy === "on"
+  readonly property bool systemProxyManaged: details.system_proxy_managed === "yes"
+  readonly property string systemProxyError: String(details.system_proxy_error || "")
 
   readonly property string egressIp: String(details.egress_ip || "")
   readonly property string carrier: String(details.operator || "")
@@ -85,23 +95,39 @@ Panel {
     if (!phonePresent)
       return "Plug in the phone with USB debugging enabled, then press Connect."
     if (!tunnelUp) {
+      if (cleanupRunning)
+        return "The phone disconnected. Restoring the normal internet settings…"
+      if (systemProxyOn)
+        return "The system proxy is still on but the tunnel is down. Turn it off to restore normal internet."
       if (!forwardPresent && gostPid === "")
         return "USB link is ready. Press Connect to start the phone-side proxy."
       if (gostPid === "")
         return "The phone-side proxy is not running. Press Connect."
       return "The USB port forward is missing. Press Connect."
     }
-    if (internetBad)
+    if (systemProxyOn && systemProxyError !== "")
+      return "System proxy is on, but " + systemProxyError + "."
+    if (internetBad) {
+      if (systemProxyOn)
+        return "The phone cannot reach the internet. Turn System proxy off to restore normal internet."
       return "The proxy is running but the phone could not reach the internet. Check that mobile data is on."
-    if (details.proxy === "yes")
-      return "Traffic is leaving through the phone's mobile data. No local internet is needed."
+    }
+    if (details.proxy === "yes") {
+      if (systemProxyOn)
+        return "Traffic is leaving through the phone's mobile data. Restart apps that were already open so they use the system proxy."
+      return "Tunnel is up. Turn on System proxy to route apps, or use the proxy browser."
+    }
+    if (systemProxyOn)
+      return "System proxy is on. New apps use the phone. Restart apps that were already open."
     return "The tunnel is up. Press refresh to test internet through the phone."
   }
 
   readonly property string tooltipText: {
     if (connected) {
       var ip = egressIp
-      return "Phone tether connected" + (ip !== "" ? " — " + ip : "")
+      return "Phone tether connected"
+        + (systemProxyOn ? " — system proxy on" : "")
+        + (ip !== "" ? " — " + ip : "")
     }
     if (phonePresent) return "Phone tether: " + statusShort
     return "Phone tether: not connected"
@@ -131,6 +157,31 @@ Panel {
     }
     details = parsed
     statusError = ""
+
+    // If the cable was pulled while the system proxy was on, restore the
+    // previous settings automatically. This is what keeps a stale SOCKS proxy
+    // from making the desktop look offline after the phone is gone.
+    if (parsed.system_proxy_managed === "yes") {
+      var phone = parsed.adb_state === "device"
+      var forward = parsed.forward === "yes"
+      var gost = String(parsed.gost_pid || "") !== ""
+      if (!phone || !forward || !gost) startCleanup()
+    }
+  }
+
+  function setProxyDetails(on) {
+    var updated = {}
+    for (var key in details) updated[key] = details[key]
+    updated.system_proxy = on ? "on" : "off"
+    updated.system_proxy_managed = on ? "yes" : "no"
+    details = updated
+  }
+
+  function startCleanup() {
+    if (cleanupRunning || busy || proxyBusy) return
+    cleanupRunning = true
+    cleanupProc.command = [proxyScript, "cleanup"]
+    cleanupProc.running = true
   }
 
   // ---------------------------------------------------------------- actions
@@ -158,12 +209,48 @@ Panel {
     refresh(true)
   }
 
+  function setSystemProxy(on) {
+    if (busy || proxyBusy) return
+    if (on && !tunnelUp) {
+      errorText = "Connect the phone before enabling the system proxy."
+      return
+    }
+    if (on === systemProxyOn) return
+
+    proxyAction = on ? "enable" : "disable"
+    errorText = ""
+    proxyStdout = ""
+    proxyStderr = ""
+    proxyProc.command = [proxyScript, on ? "enable" : "disable"]
+    proxyProc.running = true
+  }
+
+  function finishProxyAction(code) {
+    var kind = proxyAction
+    proxyAction = ""
+    if (code !== 0) {
+      var message = pickOutputError(proxyStderr, proxyStdout)
+      if (message === "")
+        message = kind === "enable" ? "Could not enable the system proxy." : "Could not restore the previous proxy settings."
+      errorText = message
+    } else {
+      errorText = ""
+      // Show the new state immediately; the status refresh confirms it.
+      setProxyDetails(kind === "enable")
+    }
+    refresh(true)
+  }
+
   function pickError() {
-    var text = String(actionStderr || "") + "\n" + String(actionStdout || "")
+    return pickOutputError(actionStderr, actionStdout)
+  }
+
+  function pickOutputError(stderrText, stdoutText) {
+    var text = String(stderrText || "") + "\n" + String(stdoutText || "")
     var lines = text.split("\n")
 
-    // connect.sh prints the useful failure as an "error:" line; the phone-side
-    // log may follow it, so prefer the first explicit error.
+    // connect.sh and proxy.sh print the useful failure as an "error:" line;
+    // a phone-side log may follow it, so prefer the first explicit error.
     for (var i = 0; i < lines.length; i++) {
       var line = lines[i].trim()
       if (line.indexOf("error:") === 0) return line.replace(/^error:\s*/, "")
@@ -193,6 +280,10 @@ Panel {
     function toggle(): void { root.toggle() }
     function connect(): void { root.startAction("connect") }
     function disconnect(): void { root.startAction("disconnect") }
+    function proxyOn(): void { root.setSystemProxy(true) }
+    function proxyOff(): void { root.setSystemProxy(false) }
+    function proxyToggle(): void { root.setSystemProxy(!root.systemProxyOn) }
+    function proxyStatus(): string { return root.systemProxyOn ? "on" : "off" }
     function refresh(): void { root.refresh(true) }
     function status(): string {
       return root.statusShort + (root.egressIp !== "" ? "|" + root.egressIp : "")
@@ -241,6 +332,52 @@ Panel {
     onExited: function(code) {
       // Let the collectors finish before reading their text.
       Qt.callLater(function() { root.finishAction(code) })
+    }
+  }
+
+  Process {
+    id: proxyProc
+    command: []
+    running: false
+
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.proxyStdout = text
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.proxyStderr = text
+    }
+    onExited: function(code) {
+      Qt.callLater(function() { root.finishProxyAction(code) })
+    }
+  }
+
+  Process {
+    id: cleanupProc
+    command: []
+    running: false
+
+    stdout: StdioCollector {
+      waitForEnd: true
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var message = String(text || "").trim()
+        if (message !== "") console.warn("zconnect/proxy-cleanup", message)
+      }
+    }
+    onExited: function(code) {
+      Qt.callLater(function() {
+        root.cleanupRunning = false
+        if (code === 0) {
+          root.setProxyDetails(false)
+        } else {
+          root.errorText = "Could not restore the previous system proxy settings."
+        }
+        root.refresh(false)
+      })
     }
   }
 
@@ -345,6 +482,32 @@ Panel {
         InfoRow { label: "Battery"; value: root.batteryLevel !== "" ? root.batteryLevel + "%" : "" }
         InfoRow { label: "Device"; value: root.phoneModel }
         InfoRow { label: "SOCKS5"; value: "127.0.0.1:" + root.proxyPort }
+      }
+
+      PanelSeparator {
+        foreground: root.foreground
+      }
+
+      Toggle {
+        width: parent.width
+        label: "System proxy"
+        description: root.proxyBusy
+          ? (root.proxyAction === "enable"
+              ? "Enabling — new apps will use the phone."
+              : "Restoring the previous settings…")
+          : (root.systemProxyOn
+              ? (root.internetBad
+                  ? "On, but the phone has no internet. Turn it off to restore normal internet."
+                  : (!root.tunnelUp
+                      ? "On, but the tunnel is down. Turn it off to restore normal internet."
+                      : "On — restart apps that were already open (Brave, etc.)."))
+              : "Off — apps use the normal connection.")
+        checked: root.proxyBusy ? root.proxyAction === "enable" : root.systemProxyOn
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        opacity: (!root.busy && !root.proxyBusy && (root.tunnelUp || root.systemProxyOn)) ? 1.0 : 0.55
+        enabled: !root.busy && !root.proxyBusy && (root.tunnelUp || root.systemProxyOn)
+        onClicked: root.setSystemProxy(!root.systemProxyOn)
       }
 
       PanelSeparator {

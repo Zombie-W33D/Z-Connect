@@ -41,6 +41,9 @@ phone mobile data ──► internet
   proxy can use it.
 - **DNS resolved on the phone.** `socks5h` keeps hostname resolution on the
   phone, so the desktop needs no working DNS.
+- **User-level system proxy.** Connect can point GNOME/GIO apps and newly
+  launched Hyprland apps at the phone, with no root. The previous settings are
+  restored on Disconnect, and a stale proxy is cleaned up after a cable pull.
 - **One-command setup and teardown.** `connect.sh`, `disconnect.sh`, and a
   machine-readable `status.sh`.
 - **Omarchy bar widget.** Phone icon, green/amber state dot, Connect and
@@ -96,6 +99,33 @@ process on the phone, exactly like a browser or chat app using mobile data.
 This is a technical property, not a promise about your carrier's terms. See
 [Legal and fair use](#legal-and-fair-use).
 
+### 5. Optional user-level system proxy
+
+SOCKS5 is only useful to apps that know to use it. `proxy.sh` adds a per-user
+system proxy so ordinary desktop apps can use the tunnel without per-app setup:
+
+- GNOME/GIO apps read the `org.gnome.system.proxy` `gsettings` values.
+- Newly launched apps inherit `SOCKS_SERVER`, `SOCKS_VERSION`, and `NO_PROXY`
+  from the Hyprland session environment (plus the systemd/D-Bus activation
+  environment).
+- Chromium-based browsers (Chrome, Chromium, Brave, Electron apps) read
+  `SOCKS_SERVER` and `SOCKS_VERSION`.
+
+Chromium treats the traditional `http_proxy`, `https_proxy`, and `all_proxy`
+variables as **HTTP** proxies. Our relay is SOCKS5, so `proxy.sh` clears those
+variables while the system proxy is on. That is deliberate: setting them breaks
+Brave/Chromium. Use `env.sh` or `curl --socks5-hostname` for terminal tools that
+need the traditional variables.
+
+`connect.sh` enables the system proxy automatically after a successful tunnel
+test. `disconnect.sh` restores the previous settings first, even if the cable is
+already gone. The panel's **System proxy** toggle can override either behavior.
+Apps that were already running must be restarted once to inherit the new
+environment.
+
+This is a user-level proxy, not a VPN. It does not change routes and does not
+capture apps that ignore both `gsettings` and the Chromium SOCKS variables.
+
 ---
 
 ## Requirements
@@ -106,6 +136,8 @@ This is a technical property, not a promise about your carrier's terms. See
   `adb`).
 - `curl`.
 - `unzip` or `python3` (only for `fetch-deps.sh`).
+- Optional: GNOME/GIO `gsettings` and a Hyprland session for the user-level
+  system proxy.
 - Optional: Omarchy with the Quickshell-based shell, for the bar widget.
 
 ### Phone
@@ -183,7 +215,8 @@ The script:
 3. pushes `gost` if it is missing,
 4. restarts the phone-side SOCKS5 proxy,
 5. recreates the USB port forward,
-6. tests the tunnel and prints the phone's public egress IP.
+6. tests the tunnel and prints the phone's public egress IP,
+7. enables the user-level system proxy unless `ZCONNECT_AUTO_PROXY=0`.
 
 A successful run looks like:
 
@@ -199,7 +232,13 @@ Testing the tunnel...
 Connected.
   SOCKS5 proxy : 127.0.0.1:1080
   Phone egress : <phone public IP>
+  System proxy : on
+  Note         : restart apps that were already open (Brave, etc.)
 ```
+
+If the system proxy cannot be enabled, the tunnel still works. The script prints
+a warning and you can use the panel toggle or `proxy.sh enable` after fixing the
+cause.
 
 ### Test it manually
 
@@ -217,6 +256,10 @@ curl https://example.com
 `env.sh` exports `ALL_PROXY`, `HTTP_PROXY`, and `HTTPS_PROXY` as
 `socks5h://127.0.0.1:1080`, so tools that honor those variables use the phone.
 
+Do not launch Brave/Chromium from a shell that has `env.sh` sourced. Chromium
+interprets those variables as HTTP proxies and fails against the SOCKS5 relay.
+Use the system proxy toggle or the browser launcher instead.
+
 ### Use it from a browser
 
 ```bash
@@ -228,6 +271,37 @@ curl https://example.com
 The launchers use a separate browser profile so they do not disturb an
 already-running browser session.
 
+### Use the system proxy
+
+`connect.sh` turns the user-level system proxy on automatically. You can also
+control it directly:
+
+```bash
+./proxy.sh status    # key=value state
+./proxy.sh enable    # save the current settings and turn the proxy on
+./proxy.sh disable   # restore the previous settings
+./proxy.sh cleanup   # restore only if the tunnel is no longer up
+```
+
+The panel has the same control as a **System proxy** toggle. Turning it on sets
+GNOME/GIO's manual SOCKS proxy and adds `SOCKS_SERVER`/`SOCKS_VERSION` to the
+Hyprland session environment for newly launched apps. It does not use `sudo`.
+
+After enabling it, restart any app that was already open (especially Brave or
+Chromium) so it inherits the new environment. Newly launched apps pick it up
+automatically.
+
+The previous proxy settings are saved in
+`~/.local/state/zconnect/proxy-backup.env` and restored by `proxy.sh disable`.
+If the phone disappears while the proxy is on, the panel runs `proxy.sh cleanup`
+and restores the settings automatically.
+
+To keep the tunnel but skip the automatic system proxy:
+
+```bash
+ZCONNECT_AUTO_PROXY=0 ./connect.sh
+```
+
 ### Check status
 
 ```bash
@@ -238,6 +312,11 @@ already-running browser session.
 Output is `key=value`, one per line:
 
 ```text
+system_proxy=on
+system_proxy_managed=yes
+system_proxy_mode=manual
+system_proxy_socks=127.0.0.1:1080
+system_proxy_error=
 adb_state=device
 model=...
 operator=...
@@ -281,24 +360,30 @@ Click the icon for a panel with:
 - battery level
 - phone model
 - SOCKS5 endpoint
+- a **System proxy** toggle
 - **Connect**, **Disconnect**, and **Refresh** controls
 
 The panel starts `connect.sh` / `disconnect.sh` and then runs `status.sh`.
 Its only network request is through the phone-side proxy, so it works while the
-desktop has no internet.
+desktop has no internet. If the cable is pulled while the system proxy is on,
+the panel restores the previous settings automatically.
 
 The widget can also be driven from a terminal or a Hyprland hotkey:
 
 ```bash
 omarchy-shell zconnect.phone-tether connect
 omarchy-shell zconnect.phone-tether disconnect
+omarchy-shell zconnect.phone-tether proxyOn
+omarchy-shell zconnect.phone-tether proxyOff
+omarchy-shell zconnect.phone-tether proxyToggle
+omarchy-shell zconnect.phone-tether proxyStatus
 omarchy-shell zconnect.phone-tether status
 omarchy-shell shell toggle zconnect.phone-tether
 ```
 
 The default script directory is `~/.local/share/z-connect`. If you installed
 elsewhere, set the widget's `scriptDir` setting to the directory containing
-`connect.sh`, `disconnect.sh`, and `status.sh`.
+`connect.sh`, `disconnect.sh`, `status.sh`, and `proxy.sh`.
 
 ### Testing with no local internet
 
@@ -308,9 +393,17 @@ elsewhere, set the widget's `scriptDir` setting to the directory containing
 3. Click the phone icon, then **Connect**.
 4. Wait up to 25 seconds. The panel should show `Connected`, the phone egress
    IP, carrier/network details, and a green dot.
+5. Confirm the **System proxy** toggle is on. Connect enables it automatically;
+   if it is off, turn it on manually.
+6. Restart any app that was already open (especially Brave/Chromium) so it
+   inherits the proxy. New apps launched after this point use the phone.
 
 If the panel shows `Ready`, the USB link works but the phone-side proxy is not
 running — press Connect.
+
+If the panel shows `Connected` but a browser still uses the normal connection,
+restart that browser. If it still ignores the proxy, use the included browser
+launcher or configure the app's SOCKS5 setting explicitly.
 
 ---
 
@@ -321,6 +414,7 @@ running — press Connect.
 | `ZCONNECT_PORT` | `1080` | Desktop and phone SOCKS5 port. `PDANET_PORT` is also accepted for compatibility. |
 | `ZCONNECT_DNS` | auto-detect + public fallbacks | Comma-separated `ip:port` resolver list for gost on the phone. |
 | `ZCONNECT_WAIT` | `25` | Seconds `connect.sh` waits for the phone. |
+| `ZCONNECT_AUTO_PROXY` | `1` | Set to `0` to connect without enabling the user-level system proxy. |
 | `ADB` | auto | Path or command name for `adb`. |
 | `ZCONNECT_DIR` | `~/.local/share/z-connect` | Installer destination. |
 | `GOST_VERSION` | `v3.3.3` | gost release used by `fetch-deps.sh`. |
@@ -332,6 +426,7 @@ Examples:
 ZCONNECT_PORT=1081 ./connect.sh
 ZCONNECT_DNS="9.9.9.9:53,1.1.1.1:53" ./connect.sh
 ZCONNECT_WAIT=60 ./connect.sh
+ZCONNECT_AUTO_PROXY=0 ./connect.sh
 ```
 
 ---
@@ -342,8 +437,9 @@ ZCONNECT_WAIT=60 ./connect.sh
   reaches it only through the `adb` USB forward. There is no LAN or internet
   listener.
 - **No credentials stored.** Z-Connect does not save passwords, tokens, or
-  account data. The only local state is the optional installed scripts and the
-  binaries in `bin/`.
+  account data. The only local state is the optional installed scripts, the
+  binaries in `bin/`, and a small proxy backup file containing the desktop's
+  previous proxy settings (not credentials).
 - **No telemetry.** Nothing is sent anywhere except the traffic you route
   through the tunnel and the one `api.ipify.org` request used to display the
   phone's egress IP.
@@ -364,10 +460,11 @@ paths. `bin/`, logs, and downloaded archives are ignored by Git.
 
 ## Limitations
 
-- **Per-app proxy, not a system-wide VPN.** Apps must honor `HTTP(S)_PROXY`,
-  use `socks5h://127.0.0.1:1080`, or be launched with the included browser
-  scripts. Routing the whole desktop requires root and a TUN device such as
-  `tun2socks`, or `redsocks` + iptables.
+- **User-level system proxy, not a VPN.** `proxy.sh` covers apps that honor
+  GNOME/GIO settings and Chromium-based apps launched after it is enabled. Apps
+  with their own proxy settings, or that ignore both, still need explicit
+  configuration. Routing the whole desktop requires root and a TUN device such
+  as `tun2socks`, or `redsocks` + iptables.
 - **The phone must stay connected.** Unplugging the cable drops the `adb`
   forward. `connect.sh` recreates it on the next run.
 - **USB debugging must stay enabled.** The phone-side process is started over
@@ -376,8 +473,9 @@ paths. `bin/`, logs, and downloaded archives are ignored by Git.
   [`bin/README.md`](bin/README.md) for armv7 and emulator options.
 - **No IPv6 DNS auto-detection.** The DNS detector currently extracts IPv4
   servers. On an IPv6-only network, set `ZCONNECT_DNS` manually.
-- **Some apps ignore proxy variables.** Browsers and many CLI tools work; some
-  Electron apps, games, and daemons need explicit proxy configuration.
+- **Some apps ignore system settings.** Browsers and many CLI tools work; games,
+  daemons, and apps with their own proxy configuration may need explicit setup.
+  Chromium-based apps must be restarted after the system proxy is enabled.
 
 ---
 
@@ -403,7 +501,8 @@ Common causes:
 | `gost not found` | Run `./fetch-deps.sh`. |
 | Proxy starts but every request fails | Mobile data off, no signal, or DNS blocked; set `ZCONNECT_DNS`. |
 | `adb: error: cannot bind listener` | Port 1080 is already in use; set `ZCONNECT_PORT`. |
-| Browser ignores the tunnel | The app does not honor the proxy; use the included launcher or configure it explicitly. |
+| Browser ignores the tunnel | Restart the browser after enabling the system proxy; if it still ignores it, use the included launcher or configure the app explicitly. |
+| No internet after unplugging the phone | The system proxy is still on. Run `./proxy.sh cleanup` or `./proxy.sh disable`, or use the panel toggle. |
 
 ---
 
@@ -429,6 +528,7 @@ Z-Connect/
 ├── connect.sh                 # start proxy + adb forward
 ├── disconnect.sh              # stop proxy + remove forward
 ├── status.sh                  # machine-readable status
+├── proxy.sh                   # user-level system proxy on/off/cleanup
 ├── env.sh                     # export proxy variables for a shell
 ├── chromium-zconnect.sh       # browser launcher
 ├── brave-zconnect.sh          # browser launcher

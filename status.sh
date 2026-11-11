@@ -12,12 +12,6 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "$HERE/lib.sh"
 
-ADB="$(zconnect_adb)" || {
-  echo "adb_state=missing"
-  echo "error=adb not found. Install platform-tools or run ./fetch-deps.sh."
-  exit 0
-}
-
 PORT="$ZCONNECT_PORT"
 FULL=0
 [[ "${1:-}" == "--full" ]] && FULL=1
@@ -27,6 +21,24 @@ emit() {
   value="${value//$'\r'/ }"
   value="${value//$'\n'/ }"
   printf '%s=%s\n' "$key" "$value"
+}
+
+# Include the system-proxy state even when the phone is unplugged. The panel
+# uses this to restore a proxy left behind by a crash.
+if [[ -x "$HERE/proxy.sh" ]]; then
+  "$HERE/proxy.sh" status 2>/dev/null || true
+else
+  emit system_proxy unknown
+  emit system_proxy_managed no
+  emit system_proxy_mode ""
+  emit system_proxy_socks ""
+  emit system_proxy_error "proxy.sh not found"
+fi
+
+ADB="$(zconnect_adb)" || {
+  emit adb_state missing
+  emit error "adb not found. Install platform-tools or run ./fetch-deps.sh."
+  exit 0
 }
 
 # First attached device, if any. `adb devices` prints:

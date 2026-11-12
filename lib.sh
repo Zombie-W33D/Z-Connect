@@ -2,7 +2,11 @@
 # Shared helpers for Z-Connect. Source this file from the other scripts.
 
 ZCONNECT_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ZCONNECT_PORT is the stable local relay port that apps use. The phone-side
+# SOCKS server and adb forward use ZCONNECT_PHONE_PORT so the relay can own the
+# stable endpoint and switch between phone and direct routes.
 ZCONNECT_PORT="${ZCONNECT_PORT:-${PDANET_PORT:-1080}}"
+ZCONNECT_PHONE_PORT="${ZCONNECT_PHONE_PORT:-$((ZCONNECT_PORT + 1))}"
 
 # Print a usable adb executable. Preference order:
 #   1. $ADB, if it is a path or a command name

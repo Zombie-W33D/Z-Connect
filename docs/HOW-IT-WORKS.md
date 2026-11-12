@@ -41,11 +41,13 @@ connections through mobile data without asking the tethering service for
 permission. If we run a proxy **on the phone**, the phone's own networking stack
 carries the traffic, and the desktop only needs a way to talk to that proxy.
 
-Z-Connect uses two standard pieces:
+Z-Connect uses three standard pieces:
 
-1. **`gost`** — a small static Go proxy that listens for SOCKS5 on the phone's
+1. **`relay.py`** — a small user-level SOCKS5 relay on the desktop that owns a
+   stable loopback port and switches between the phone and the normal network.
+2. **`gost`** — a small static Go proxy that listens for SOCKS5 on the phone's
    loopback interface.
-2. **`adb forward`** — a USB tunnel that maps a desktop loopback port to a phone
+3. **`adb forward`** — a USB tunnel that maps a desktop loopback port to a phone
    loopback port.
 
 No root, no RNDIS, no `dun` APN, no tethering entitlement check.
@@ -59,15 +61,19 @@ No root, no RNDIS, no `dun` APN, no tethering entitlement check.
 │                                                                  │
 │  browser / curl / app                                            │
 │      │                                                           │
-│      │ SOCKS5 (or socks5h) to 127.0.0.1:1080                     │
+│      │ SOCKS5 (or socks5h) to 127.0.0.1:1080 (stable relay)       │
 │      ▼                                                           │
-│  adb server                                                      │
+│  relay.py                                                        │
+│      ├── phone mode  ──► 127.0.0.1:1081                          │
+│      └── direct mode ──► normal desktop network                  │
+│                              │                                   │
+│  adb server ◄────────────────┘                                   │
 │      │  USB cable                                                │
 └──────┼───────────────────────────────────────────────────────────┘
        │
 ┌──────▼──────────────────────── phone ────────────────────────────┐
 │                                                                  │
-│  adbd  ──► 127.0.0.1:1080                                        │
+│  adbd  ──► 127.0.0.1:1081                                        │
 │                 │                                                │
 │                 ▼                                                │
 │          gost (UID 2000, /data/local/tmp/zconnect-gost)          │
@@ -81,16 +87,44 @@ No root, no RNDIS, no `dun` APN, no tethering entitlement check.
 ### Step by step
 
 1. The desktop application connects to `127.0.0.1:1080`.
-2. The `adb` client forwards that connection over USB to the phone's
-   `127.0.0.1:1080`.
-3. `gost` accepts the SOCKS5 request. With `socks5h`, the hostname arrives
+2. `relay.py` reads its mode file. In phone mode it opens a SOCKS5 connection
+   to `127.0.0.1:1081`; in direct mode it connects to the destination itself.
+3. In phone mode, the `adb` client forwards the connection over USB to the
+   phone's `127.0.0.1:1081`.
+4. `gost` accepts the SOCKS5 request. With `socks5h`, the hostname arrives
    unresolved.
-4. `gost` resolves the hostname using its configured resolver list, then opens a
+5. `gost` resolves the hostname using its configured resolver list, then opens a
    normal TCP connection from the phone.
-5. Return traffic follows the same path in reverse.
+6. Return traffic follows the same path in reverse.
 
 The desktop never needs a default route, a working DNS server, or a Wi-Fi
 adapter. It only needs the USB cable and a local loopback port.
+
+### Live route switching
+
+Windows lets an open app move to a new network because the app keeps using the
+same socket API and the operating system re-routes new connections. A proxy
+setup normally cannot do that: if an app is configured to use a dead proxy, the
+app fails until it is restarted with new settings.
+
+The relay fixes that by making the app-facing endpoint permanent:
+
+- apps always use `127.0.0.1:1080`;
+- the relay reads its mode for each new connection;
+- `connect.sh` sets phone mode after the tunnel is up;
+- `disconnect.sh` and `proxy.sh disable` set direct mode before tearing the
+  tunnel down;
+- if the phone fails while the mode says phone, the relay logs the failure and
+  falls back to a direct connection instead of returning an error.
+
+So an open browser, terminal, or chat app that was pointed at the relay switches
+on its next connection. Connections that are already established stay on their
+original route, and a browser may reuse a pooled connection for a while. A new
+tab, a reload, or a fresh request uses the new route.
+
+Apps that were launched before the first Connect and were talking directly to
+the internet need one restart to start using the relay. After that, every phone
+connect/disconnect is transparent to them.
 
 ---
 
@@ -117,13 +151,48 @@ originates the traffic. See the legal note in the README.
 
 ## 5. Components
 
+### `relay.py` and `relay.sh`
+
+`relay.py` is a small Python 3 SOCKS5 relay with a switchable upstream. It
+implements TCP `CONNECT` only; UDP `ASSOCIATE` is rejected. It listens on the
+desktop's `127.0.0.1:1080` and reads a mode file for each new connection:
+
+```text
+phone  → SOCKS5 to 127.0.0.1:1081 (the adb-forwarded phone proxy)
+direct → resolve and connect to the destination from the desktop
+```
+
+If phone mode cannot reach the phone, the relay logs a rate-limited warning and
+falls back to direct. That fallback is what keeps open apps working when the
+cable is pulled. Set `ZCONNECT_RELAY_FALLBACK_DIRECT=0` to make failures
+explicit instead.
+
+`relay.sh` manages the relay process:
+
+```text
+relay.sh start | stop | restart | ensure
+relay.sh mode phone | mode direct
+relay.sh status | cleanup | log
+```
+
+State lives in `~/.local/state/zconnect/`:
+
+- `relay.pid` — the relay process ID;
+- `relay-mode` — `phone` or `direct`;
+- `relay.log` — relay output;
+- `relay.lock` — serializes start/stop/mode changes.
+
+The relay uses no root, no TUN device, and no route changes. It is a user-space
+proxy, not a VPN. Only TCP is supported; apps that need UDP through the tunnel
+are out of scope.
+
 ### `gost`
 
 [gost](https://github.com/go-gost/gost) is a static Go proxy. Z-Connect uses it
 in SOCKS5 server mode:
 
 ```text
-gost -L 'socks5://127.0.0.1:1080?resolver=<dns-list>'
+gost -L 'socks5://127.0.0.1:1081?resolver=<dns-list>'
 ```
 
 Why gost:
@@ -139,9 +208,10 @@ survive a phone reboot, but `connect.sh` starts it again.
 
 ### `adb forward`
 
-`adb forward tcp:1080 tcp:1080` creates a listener on the desktop's loopback
+`adb forward tcp:1081 tcp:1081` creates a listener on the desktop's loopback
 interface and forwards each connection to the phone's loopback interface over
-the USB transport.
+the USB transport. The stable app-facing relay owns `1080`, so the forward uses
+the phone port (`1081` by default).
 
 Properties:
 
@@ -156,29 +226,36 @@ Responsibilities:
 
 1. Find a usable `adb` (explicit `ADB`, `PATH`, or `bin/adb`).
 2. Start the `adb` server and wait for an authorized device.
-3. Detect the phone's IPv4 DNS servers from `dumpsys connectivity`.
-4. Push `gost` if `/data/local/tmp/zconnect-gost` is missing or not executable.
-5. Kill any previous `zconnect-gost` process and start a fresh one.
-6. Recreate the `adb` forward.
-7. Test the tunnel through `https://api.ipify.org` and print the egress IP.
-8. Enable the user-level system proxy unless `ZCONNECT_AUTO_PROXY=0`.
+3. Start the stable local relay on `ZCONNECT_PORT` and set it to phone mode.
+4. Detect the phone's IPv4 DNS servers from `dumpsys connectivity`.
+5. Push `gost` if `/data/local/tmp/zconnect-gost` is missing or not executable.
+6. Kill any previous `zconnect-gost` process and start a fresh one on
+   `ZCONNECT_PHONE_PORT`.
+7. Recreate the `adb` forward for `ZCONNECT_PHONE_PORT`.
+8. Test the phone tunnel directly, then through the relay, and print the egress
+   IP.
+9. Enable the user-level system proxy unless `ZCONNECT_AUTO_PROXY=0`.
 
 The script is idempotent: running it repeatedly is safe.
 
 ### `disconnect.sh`
 
 Restores the previous system-proxy settings first (this works even if the cable
-is already gone), then kills `zconnect-gost` on the phone and removes the port
+is already gone), sets the relay to direct mode so open apps fall back to the
+normal network, then kills `zconnect-gost` on the phone and removes the port
 forward. It leaves the rest of the desktop's networking untouched.
 
 ### `status.sh`
 
 Emits `key=value` lines. Quick mode only inspects `adb` state, the forward, and
 the phone-side process. `--full` additionally makes one request through the
-proxy to confirm end-to-end connectivity and retrieve the phone's egress IP.
+phone proxy to confirm end-to-end connectivity and retrieve the phone's egress
+IP.
 
-It also emits `system_proxy`, `system_proxy_managed`, `system_proxy_mode`,
-`system_proxy_socks`, and `system_proxy_error` before the phone checks, so the
+It also emits the relay state (`relay_running`, `relay_pid`, `relay_mode`,
+`relay_port`, `phone_port`, `relay_fallback_direct`) and the system-proxy state
+(`system_proxy`, `system_proxy_managed`, `system_proxy_mode`,
+`system_proxy_socks`, `system_proxy_error`) before the phone checks, so the
 panel can restore a proxy left behind after a crash or cable pull.
 
 The script deliberately exits 0 even when the phone is missing, because the bar
@@ -189,10 +266,12 @@ widget polls it.
 Manages the optional user-level system proxy:
 
 - `status` prints the current state and whether Z-Connect owns it;
-- `enable` saves the current settings, then sets the GNOME/GIO manual SOCKS
-  proxy and the Hyprland session environment;
-- `disable` restores the saved settings;
-- `cleanup` restores them only when the phone tunnel is no longer up.
+- `enable` ensures the relay is running, sets it to phone mode, checks the phone
+  tunnel directly and through the relay, then saves the current settings and
+  sets the GNOME/GIO manual SOCKS proxy and the Hyprland session environment;
+- `disable` sets the relay to direct mode, then restores the saved settings;
+- `cleanup` restores them only when the phone tunnel is no longer up, and also
+  puts the relay in direct mode.
 
 The backup lives in `~/.local/state/zconnect/proxy-backup.env`; a marker and a
 lock file live next to it. No root is required.
@@ -204,10 +283,11 @@ The widget is a single `Panel.qml` registered as a bar widget. It:
 - renders the phone icon and state dot;
 - runs `status.sh` every 60 seconds when closed and every 15 seconds when open;
 - runs `connect.sh` / `disconnect.sh` as child processes;
+- shows the current route (Phone or Direct) and the SOCKS5 endpoint;
 - shows the latest error output if an action fails;
 - exposes IPC methods (`open`, `close`, `toggle`, `connect`, `disconnect`,
-  `proxyOn`, `proxyOff`, `proxyToggle`, `proxyStatus`, `refresh`, `status`) so
-  it can be driven by a hotkey.
+  `proxyOn`, `proxyOff`, `proxyToggle`, `proxyStatus`, `relayStatus`, `refresh`,
+  `status`) so it can be driven by a hotkey.
 
 It does not need local internet because the only network request it triggers is
 the `--full` status probe through the phone proxy.
@@ -299,21 +379,25 @@ The backup is `~/.local/state/zconnect/proxy-backup.env`. A marker file
 which is created with mode `700`. The lock uses `flock` so a panel toggle and a
 script cannot apply settings at the same time.
 
-`enable` first checks the tunnel through the SOCKS proxy. It applies the
-`gsettings` values, then the environment, and sets `mode=manual` last so a
-partial failure does not cut the desktop over to a dead proxy. If applying the
-settings fails, it restores the backup immediately.
+`enable` first ensures the relay is running and in phone mode, then checks the
+phone tunnel directly (so the relay's direct fallback cannot hide a dead phone),
+then checks the relay endpoint. It applies the `gsettings` values, then the
+environment, and sets `mode=manual` last so a partial failure does not cut the
+desktop over to a dead proxy. If applying the settings fails, it restores the
+backup immediately and puts the relay back in direct mode.
 
-`disable` restores the saved settings and removes the backup. If there is no
-backup, it only clears settings that still point at Z-Connect's own endpoint, so
-it does not stomp on an unrelated proxy configuration.
+`disable` puts the relay in direct mode first, then restores the saved settings
+and removes the backup. The relay stays alive, so apps that were pointed at it
+continue through the normal network. If there is no backup, `disable` only clears
+settings that still point at Z-Connect's own endpoint, so it does not stomp on an
+unrelated proxy configuration.
 
 `cleanup` is the crash-recovery path. It checks whether the tunnel is still up;
-if the forward or the phone-side process is gone, it calls `disable`. The
-Omarchy panel calls `cleanup` whenever `status.sh` reports
-`system_proxy_managed=yes` while the tunnel is down. That is what prevents a
-stale SOCKS proxy from making the desktop look offline after the phone is
-unplugged.
+if the forward or the phone-side process is gone, it puts the relay in direct
+mode and calls `disable`. The Omarchy panel calls `cleanup` whenever `status.sh`
+reports `system_proxy_managed=yes` while the tunnel is down. That is what
+prevents a stale SOCKS proxy from making the desktop look offline after the
+phone is unplugged.
 
 ### Automatic behavior
 
@@ -328,7 +412,9 @@ unplugged.
 
 This is a user-level proxy, not a VPN. It does not change routes, and it cannot
 capture an app that ignores both `gsettings` and the Chromium SOCKS variables.
-Apps that were already running must be restarted to inherit the environment.
+Apps that were already running need one restart the first time the proxy is
+enabled so they inherit the environment. After that they point at the stable
+relay and switch routes automatically on new connections.
 On a non-GNOME desktop without Hyprland, fewer apps will see the change; the
 browser launchers and explicit proxy settings remain the fallback.
 
@@ -338,15 +424,15 @@ browser launchers and explicit proxy settings remain the fallback.
 
 | Event | What survives | What breaks |
 | --- | --- | --- |
-| Desktop reboot | Phone-side gost may still run; `bin/` files | `adb` server and forward are gone |
-| Unplug/replug phone | Phone-side gost may still run | `adb` forward is gone |
-| Unplug while system proxy is on | The saved proxy backup | The panel/`proxy.sh cleanup` restores the previous proxy settings |
+| Desktop reboot | Phone-side gost may still run; `bin/` files | `adb` server, forward, and relay are gone |
+| Unplug/replug phone | Phone-side gost may still run; relay falls back to direct | `adb` forward is gone |
+| Unplug while system proxy is on | The saved proxy backup; the relay in direct mode | The panel/`proxy.sh cleanup` restores the previous proxy settings |
 | Phone reboot | Nothing on the phone side | `gost` process and forward are gone |
-| `disconnect.sh` | Binaries and scripts | gost process and forward are gone; previous proxy settings are restored |
-| `adb kill-server` | Phone-side gost | Forward is gone |
+| `disconnect.sh` | Binaries, scripts, and the relay in direct mode | gost process and forward are gone; previous proxy settings are restored |
+| `adb kill-server` | Phone-side gost; the relay in direct mode | Forward is gone |
 
-In all cases, run `./connect.sh` again. It re-pushes gost only if missing and
-recreates the forward.
+In all cases, run `./connect.sh` again. It re-pushes gost only if missing,
+recreates the forward, and sets the relay back to phone mode.
 
 ---
 
@@ -354,12 +440,13 @@ recreates the forward.
 
 ### What is exposed
 
-- A SOCKS5 listener on the **phone's** `127.0.0.1:1080`.
-- An `adb` forward on the **desktop's** `127.0.0.1:1080`.
+- A SOCKS5 relay listener on the **desktop's** `127.0.0.1:1080`.
+- An `adb` forward on the **desktop's** `127.0.0.1:1081`.
+- A SOCKS5 listener on the **phone's** `127.0.0.1:1081`.
 
-Neither listener is bound to a LAN interface. An attacker on the same Wi-Fi or
-ethernet network cannot connect to either one. Access requires either the
-desktop's local user account or the USB/ADB connection.
+None of these listeners is bound to a LAN interface. An attacker on the same
+Wi-Fi or ethernet network cannot connect to any of them. Access requires either
+the desktop's local user account or the USB/ADB connection.
 
 ### Trust assumptions
 
@@ -433,12 +520,13 @@ standard on Android) and more setup. `gost` + `adb` is lighter.
 | Choice | Benefit | Cost |
 | --- | --- | --- |
 | SOCKS5 instead of a TUN device | No root; simple; works with common apps | Per-app configuration; not system-wide |
-| User-level system proxy | No root; GNOME/GIO and Chromium apps work | Not a VPN; already-open apps need a restart; apps with their own proxy config may ignore it |
+| Stable local relay | Apps keep one proxy setting and switch routes without a restart | One extra user-level process; TCP only |
+| User-level system proxy | No root; GNOME/GIO and Chromium apps work | Not a VPN; apps that were direct need one restart; apps with their own proxy config may ignore it |
 | gost on the phone | Avoids tethering stack; static binary | Must match phone ABI; process must be started over ADB |
 | `adb forward` | No extra network listener; USB-only | Forward does not survive unplug/reboot |
 | Remote DNS | Works with no desktop DNS | Requires `socks5h`-aware clients |
 | Explicit resolver list | Reliable on Android | Needs auto-detection or manual override on unusual networks |
-| Omarchy widget | One-click connect/disconnect | Optional; tied to Omarchy/Quickshell |
+| Omarchy widget | One-click connect/disconnect and visible route | Optional; tied to Omarchy/Quickshell |
 
 ---
 
@@ -449,11 +537,13 @@ standard on Android) and more setup. `gost` + `adb` is lighter.
 | Phone not seen | `adb devices`, cable, USB debugging authorization |
 | gost not starting | `adb shell cat /data/local/tmp/zconnect-gost.log` |
 | Wrong binary format | `file bin/gost`; use the correct ABI asset |
-| Port conflict | `ss -ltnp | grep 1080`; change `ZCONNECT_PORT` |
+| Port conflict | `ss -ltnp | grep -E '1080|1081'`; change `ZCONNECT_PORT` or `ZCONNECT_PHONE_PORT` |
+| Relay says Direct while the phone is up | `./relay.sh status`, `./status.sh --quick`; run `./relay.sh mode phone` or press Connect |
+| Relay missing or crashed | `./relay.sh log`; `./relay.sh ensure` |
 | Proxy up, DNS fails | Set `ZCONNECT_DNS`; test with `curl --socks5-hostname` |
 | Proxy up, phone has no data | Check mobile data toggle and signal |
-| System proxy on, app still direct | Restart the app; check `./proxy.sh status` and the gsettings values |
-| No internet after unplugging the phone | Run `./proxy.sh cleanup` or `./proxy.sh disable`; the panel also does this |
+| System proxy on, app still direct | Restart the app once; check `./proxy.sh status` and the gsettings values |
+| No internet after unplugging the phone | The relay should be in direct mode; run `./proxy.sh cleanup` or `./proxy.sh disable`; the panel also does this |
 | Browser ignores system proxy | Use `chromium-zconnect.sh` or configure the app explicitly |
 
 More detail: [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).

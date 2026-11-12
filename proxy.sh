@@ -3,7 +3,8 @@
 #
 # This does not create a VPN or change routes. It tells applications that honor
 # the desktop's proxy settings (GNOME/GIO settings, and the Hyprland session
-# environment for newly launched apps) to use the phone's SOCKS5 port.
+# environment for newly launched apps) to use the stable local relay, which
+# forwards to the phone or falls back to the normal network.
 #
 # Commands:
 #   proxy.sh status   print key=value state
@@ -17,6 +18,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/lib.sh"
 
 PORT="$ZCONNECT_PORT"
+PHONE_PORT="$ZCONNECT_PHONE_PORT"
+RELAY="$HERE/relay.sh"
 PROXY_HOST="127.0.0.1"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/zconnect"
 BACKUP="$STATE_DIR/proxy-backup.env"
@@ -276,8 +279,30 @@ cmd_status() {
 cmd_enable() {
   lock_state || return 1
 
-  if ! curl -fsS --socks5-hostname "$PROXY_HOST:$PORT" --max-time 8 https://api.ipify.org >/dev/null 2>&1; then
+  if [[ ! -x "$RELAY" ]]; then
+    echo "error: relay.sh not found. Reinstall the scripts." >&2
+    return 1
+  fi
+
+  if ! "$RELAY" ensure; then
+    echo "error: could not start the stable local relay." >&2
+    return 1
+  fi
+  if ! "$RELAY" mode phone >/dev/null; then
+    echo "error: could not put the relay in phone mode." >&2
+    return 1
+  fi
+
+  # Check the phone tunnel directly, then the stable relay endpoint. Testing
+  # only the relay would pass on its direct fallback even when the phone is down.
+  if ! curl -fsS --socks5-hostname "$PROXY_HOST:$PHONE_PORT" --max-time 8 https://api.ipify.org >/dev/null 2>&1; then
     echo "error: the phone tunnel is not working. Connect the phone first." >&2
+    "$RELAY" mode direct >/dev/null 2>&1 || true
+    return 1
+  fi
+  if ! curl -fsS --socks5-hostname "$PROXY_HOST:$PORT" --max-time 8 https://api.ipify.org >/dev/null 2>&1; then
+    echo "error: the phone works, but the local relay did not answer." >&2
+    "$RELAY" mode direct >/dev/null 2>&1 || true
     return 1
   fi
 
@@ -291,19 +316,31 @@ cmd_enable() {
   if ! apply_settings; then
     echo "error: could not apply the system proxy settings." >&2
     restore_settings >/dev/null 2>&1 || true
+    "$RELAY" mode direct >/dev/null 2>&1 || true
     return 1
   fi
 
-  echo "System proxy enabled: SOCKS5 ${PROXY_HOST}:${PORT}"
-  echo "Restart apps that were already open so they pick up the proxy."
+  echo "System proxy enabled: SOCKS5 ${PROXY_HOST}:${PORT} (stable relay)"
+  echo "Open apps already using the relay switch routes automatically."
+  echo "Apps that were using a direct connection need one restart to pick it up."
 }
 
 cmd_disable() {
   lock_state || return 1
 
+  # Keep the relay alive in direct mode so apps that were already pointed at it
+  # continue working through the normal network instead of a dead phone proxy.
+  if [[ -f "$BACKUP" && -x "$RELAY" ]]; then
+    "$RELAY" ensure >/dev/null 2>&1 || true
+  fi
+  if [[ -x "$RELAY" ]]; then
+    "$RELAY" mode direct >/dev/null 2>&1 || true
+  fi
+
   if [[ -f "$BACKUP" ]]; then
     restore_settings
     echo "System proxy disabled; previous proxy settings restored."
+    echo "Relay is in direct mode; open apps using it now use the normal network."
   else
     restore_settings >/dev/null 2>&1 || true
     echo "System proxy is already off."
@@ -311,11 +348,20 @@ cmd_disable() {
 }
 
 cmd_cleanup() {
+  local up=0
+  if tunnel_up; then
+    up=1
+  fi
+
+  if [[ "$up" == "0" && -x "$RELAY" ]]; then
+    "$RELAY" mode direct >/dev/null 2>&1 || true
+  fi
+
   if [[ ! -f "$BACKUP" ]]; then
     echo "System proxy is off."
     return 0
   fi
-  if tunnel_up; then
+  if [[ "$up" == "1" ]]; then
     echo "System proxy is on and the tunnel is up."
     return 0
   fi

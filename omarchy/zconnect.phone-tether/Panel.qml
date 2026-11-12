@@ -66,6 +66,9 @@ Panel {
   readonly property bool systemProxyOn: details.system_proxy === "on"
   readonly property bool systemProxyManaged: details.system_proxy_managed === "yes"
   readonly property string systemProxyError: String(details.system_proxy_error || "")
+  readonly property string relayMode: String(details.relay_mode || "")
+  readonly property bool relayRunning: details.relay_running === "yes"
+  readonly property string relayLabel: relayMode === "phone" ? "Phone" : (relayMode === "direct" ? "Direct" : "—")
 
   readonly property string egressIp: String(details.egress_ip || "")
   readonly property string carrier: String(details.operator || "")
@@ -99,6 +102,8 @@ Panel {
         return "The phone disconnected. Restoring the normal internet settings…"
       if (systemProxyOn)
         return "The system proxy is still on but the tunnel is down. Turn it off to restore normal internet."
+      if (relayRunning && relayMode === "direct")
+        return "The relay is in direct mode. Open apps using it now use the normal network."
       if (!forwardPresent && gostPid === "")
         return "USB link is ready. Press Connect to start the phone-side proxy."
       if (gostPid === "")
@@ -107,18 +112,20 @@ Panel {
     }
     if (systemProxyOn && systemProxyError !== "")
       return "System proxy is on, but " + systemProxyError + "."
+    if (systemProxyOn && !relayRunning)
+      return "System proxy is on, but the stable relay is not running. Toggle it off and on."
     if (internetBad) {
       if (systemProxyOn)
-        return "The phone cannot reach the internet. Turn System proxy off to restore normal internet."
+        return "The phone cannot reach the internet. Turn System proxy off to fall back to the normal network."
       return "The proxy is running but the phone could not reach the internet. Check that mobile data is on."
     }
     if (details.proxy === "yes") {
       if (systemProxyOn)
-        return "Traffic is leaving through the phone's mobile data. Restart apps that were already open so they use the system proxy."
+        return "Traffic is leaving through the phone. Open apps using the relay switch routes automatically."
       return "Tunnel is up. Turn on System proxy to route apps, or use the proxy browser."
     }
     if (systemProxyOn)
-      return "System proxy is on. New apps use the phone. Restart apps that were already open."
+      return "System proxy is on. Apps using the relay switch to the phone automatically."
     return "The tunnel is up. Press refresh to test internet through the phone."
   }
 
@@ -127,6 +134,7 @@ Panel {
       var ip = egressIp
       return "Phone tether connected"
         + (systemProxyOn ? " — system proxy on" : "")
+        + (relayMode !== "" ? " — " + relayLabel + " route" : "")
         + (ip !== "" ? " — " + ip : "")
     }
     if (phonePresent) return "Phone tether: " + statusShort
@@ -284,6 +292,7 @@ Panel {
     function proxyOff(): void { root.setSystemProxy(false) }
     function proxyToggle(): void { root.setSystemProxy(!root.systemProxyOn) }
     function proxyStatus(): string { return root.systemProxyOn ? "on" : "off" }
+    function relayStatus(): string { return root.relayMode }
     function refresh(): void { root.refresh(true) }
     function status(): string {
       return root.statusShort + (root.egressIp !== "" ? "|" + root.egressIp : "")
@@ -482,6 +491,7 @@ Panel {
         InfoRow { label: "Battery"; value: root.batteryLevel !== "" ? root.batteryLevel + "%" : "" }
         InfoRow { label: "Device"; value: root.phoneModel }
         InfoRow { label: "SOCKS5"; value: "127.0.0.1:" + root.proxyPort }
+        InfoRow { label: "Route"; value: root.relayLabel }
       }
 
       PanelSeparator {
@@ -493,15 +503,15 @@ Panel {
         label: "System proxy"
         description: root.proxyBusy
           ? (root.proxyAction === "enable"
-              ? "Enabling — new apps will use the phone."
+              ? "Enabling — apps using the relay will use the phone."
               : "Restoring the previous settings…")
           : (root.systemProxyOn
               ? (root.internetBad
-                  ? "On, but the phone has no internet. Turn it off to restore normal internet."
+                  ? "On, but the phone has no internet. Turn it off to fall back to the normal network."
                   : (!root.tunnelUp
                       ? "On, but the tunnel is down. Turn it off to restore normal internet."
-                      : "On — restart apps that were already open (Brave, etc.)."))
-              : "Off — apps use the normal connection.")
+                      : "On — apps using the relay switch routes automatically."))
+              : "Off — the relay uses the normal connection.")
         checked: root.proxyBusy ? root.proxyAction === "enable" : root.systemProxyOn
         foreground: root.foreground
         fontFamily: root.fontFamily

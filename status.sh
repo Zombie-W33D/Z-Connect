@@ -5,14 +5,15 @@
 #   status.sh --full   also test the SOCKS5 tunnel and fetch the phone egress IP
 #
 # This script never needs the desktop's own internet: the only network request
-# it makes is through the phone-side proxy at 127.0.0.1:$PORT.
+# it makes is through the phone-side proxy at 127.0.0.1:$PHONE_PORT.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 source "$HERE/lib.sh"
 
-PORT="$ZCONNECT_PORT"
+RELAY_PORT="$ZCONNECT_PORT"
+PHONE_PORT="$ZCONNECT_PHONE_PORT"
 FULL=0
 [[ "${1:-}" == "--full" ]] && FULL=1
 
@@ -23,8 +24,19 @@ emit() {
   printf '%s=%s\n' "$key" "$value"
 }
 
-# Include the system-proxy state even when the phone is unplugged. The panel
-# uses this to restore a proxy left behind by a crash.
+# Include the relay and system-proxy state even when the phone is unplugged.
+# The panel uses these to restore a proxy left behind by a crash.
+if [[ -x "$HERE/relay.sh" ]]; then
+  "$HERE/relay.sh" status 2>/dev/null || true
+else
+  emit relay_running unknown
+  emit relay_pid ""
+  emit relay_mode ""
+  emit relay_port "$RELAY_PORT"
+  emit phone_port "$PHONE_PORT"
+  emit relay_fallback_direct unknown
+fi
+
 if [[ -x "$HERE/proxy.sh" ]]; then
   "$HERE/proxy.sh" status 2>/dev/null || true
 else
@@ -38,6 +50,8 @@ fi
 ADB="$(zconnect_adb)" || {
   emit adb_state missing
   emit error "adb not found. Install platform-tools or run ./fetch-deps.sh."
+  emit port "$RELAY_PORT"
+  emit phone_port "$PHONE_PORT"
   exit 0
 }
 
@@ -57,7 +71,8 @@ if [[ "$state" != "device" ]]; then
   emit forward no
   emit gost_pid ""
   emit proxy unknown
-  emit port "$PORT"
+  emit port "$RELAY_PORT"
+  emit phone_port "$PHONE_PORT"
   exit 0
 fi
 
@@ -71,14 +86,14 @@ battery="$("$ADB" shell dumpsys battery 2>/dev/null | awk -F': ' '/^[[:space:]]*
 gost_pid="$("$ADB" shell pidof zconnect-gost 2>/dev/null | tr -d '\r')"
 
 forward="no"
-if "$ADB" forward --list 2>/dev/null | awk -v p="tcp:$PORT" '$2 == p { found = 1 } END { exit(found ? 0 : 1) }'; then
+if "$ADB" forward --list 2>/dev/null | awk -v p="tcp:$PHONE_PORT" '$2 == p { found = 1 } END { exit(found ? 0 : 1) }'; then
   forward="yes"
 fi
 
 proxy="unknown"
 egress=""
 if [[ "$forward" == "yes" && -n "$gost_pid" && "$FULL" == "1" ]]; then
-  if egress="$(curl -fsS --socks5-hostname "127.0.0.1:${PORT}" --max-time 12 https://api.ipify.org 2>/dev/null)"; then
+  if egress="$(curl -fsS --socks5-hostname "127.0.0.1:${PHONE_PORT}" --max-time 12 https://api.ipify.org 2>/dev/null)"; then
     egress="$(printf '%s' "$egress" | tr -d '\r\n ')"
     proxy="yes"
   else
@@ -94,5 +109,6 @@ emit battery "$battery"
 emit gost_pid "$gost_pid"
 emit forward "$forward"
 emit proxy "$proxy"
-emit port "$PORT"
+emit port "$RELAY_PORT"
+emit phone_port "$PHONE_PORT"
 emit egress_ip "$egress"

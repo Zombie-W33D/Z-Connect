@@ -8,11 +8,12 @@ adb shell pidof zconnect-gost
 adb shell cat /data/local/tmp/zconnect-gost.log
 ```
 
-Then check the forward and the local port:
+Then check the forward, the relay, and the local ports:
 
 ```bash
 adb forward --list
-ss -ltnp | grep 1080
+./relay.sh status
+ss -ltnp | grep -E '1080|1081'
 ```
 
 For a full end-to-end check:
@@ -117,33 +118,37 @@ adb shell dumpsys connectivity | grep DnsAddresses
 
 ---
 
-## Port 1080 is already in use
+## Port 1080 or 1081 is already in use
 
 Symptoms:
 
 ```text
 adb: error: cannot bind listener: Address already in use
+error: port 1080 is already in use.
 ```
 
-Find the local listener:
+Find the local listeners:
 
 ```bash
-ss -ltnp | grep 1080
+ss -ltnp | grep -E '1080|1081'
 ```
 
-Either stop that process or use another port:
+The relay owns `1080`; the `adb` forward and the phone-side `gost` own `1081`.
+Stop whatever else is using those ports, or move Z-Connect:
 
 ```bash
-ZCONNECT_PORT=1081 ./connect.sh
+ZCONNECT_PORT=1082 ZCONNECT_PHONE_PORT=1083 ./connect.sh
 ```
 
-If you change the port, use the same value for clients:
+If you change the ports, use the same relay port for clients:
 
 ```bash
-curl --socks5-hostname 127.0.0.1:1081 https://api.ipify.org
-export ZCONNECT_PORT=1081
+curl --socks5-hostname 127.0.0.1:1082 https://api.ipify.org
+export ZCONNECT_PORT=1082
 source ./env.sh
 ```
+
+`ZCONNECT_PHONE_PORT` defaults to the relay port plus one.
 
 ---
 
@@ -159,9 +164,11 @@ gsettings get org.gnome.system.proxy.socks host
 gsettings get org.gnome.system.proxy.socks port
 ```
 
-If `system_proxy=on` but the browser was already open, **restart the browser**.
-Already-running apps keep the environment they started with. New apps launched
-after the proxy is enabled inherit `SOCKS_SERVER`/`SOCKS_VERSION`.
+If `system_proxy=on` but the browser was already open, **restart the browser
+once**. Already-running apps keep the environment they started with. After that
+restart the browser points at the stable relay and switches routes without
+another restart. New apps launched after the proxy is enabled inherit
+`SOCKS_SERVER`/`SOCKS_VERSION` immediately.
 
 If the browser still ignores it, use the included launcher:
 
@@ -189,10 +196,83 @@ configuration.
 
 ---
 
+## The relay is in Direct mode while the phone is connected
+
+Check the pieces:
+
+```bash
+cd ~/.local/share/z-connect
+./relay.sh status
+./status.sh --quick
+./relay.sh log
+```
+
+`status.sh` should show `forward=yes` and a non-empty `gost_pid`. If it does,
+put the relay back in phone mode:
+
+```bash
+./relay.sh mode phone
+curl --socks5-hostname 127.0.0.1:1080 https://api.ipify.org
+```
+
+If that prints the desktop's normal public IP instead of the phone's, the relay
+is still falling back. The log will contain `phone upstream unavailable`. Check
+the phone-side proxy directly:
+
+```bash
+curl --socks5-hostname 127.0.0.1:1081 https://api.ipify.org
+```
+
+If the `1081` test fails, the phone side is down; press Connect or rerun
+`./connect.sh`. If `1081` works but `1080` still falls back, restart the relay:
+
+```bash
+./relay.sh restart
+./relay.sh mode phone
+```
+
+`./relay.sh ensure` starts the relay without changing the mode. The relay is
+optional for basic use, but the system proxy and live switching depend on it.
+
+---
+
+## The relay will not start
+
+Symptoms:
+
+```text
+error: python3 is required for the relay.
+error: relay.py not found next to relay.sh.
+error: the relay exited during startup.
+```
+
+Fixes:
+
+- install Python 3 (`python3 --version`);
+- reinstall the scripts, or copy `relay.py` next to `relay.sh`;
+- free the relay port, or set `ZCONNECT_PORT`;
+- read `~/.local/state/zconnect/relay.log`.
+
+You can run the relay by hand to see errors directly:
+
+```bash
+cd ~/.local/share/z-connect
+python3 relay.py --listen 127.0.0.1:1080 --upstream 127.0.0.1:1081 \
+  --mode-file ~/.local/state/zconnect/relay-mode
+```
+
+To make the relay fail instead of falling back to the normal network when the
+phone is unreachable, start it with `--no-fallback-direct` or set
+`ZCONNECT_RELAY_FALLBACK_DIRECT=0` before `./relay.sh start`.
+
+---
+
 ## No internet after unplugging the phone (stale system proxy)
 
 If the desktop cannot reach the internet after the phone is gone, the system
-proxy may still be pointing at the dead tunnel. Restore it:
+proxy may still be pointing at the dead tunnel. The relay should already be in
+direct mode, so apps using it fall back automatically. Restore the proxy
+settings as well:
 
 ```bash
 cd ~/.local/share/z-connect
@@ -208,12 +288,14 @@ Check the result:
 
 ```bash
 ./proxy.sh status
+./relay.sh status
 gsettings get org.gnome.system.proxy mode
 ```
 
-The panel does this automatically when it sees `system_proxy_managed=yes` while
-the tunnel is down. If it does not, open the panel and press **Refresh**, or run
-the commands above.
+`proxy.sh disable` and `cleanup` both put the relay in direct mode. The panel
+does this automatically when it sees `system_proxy_managed=yes` while the tunnel
+is down. If it does not, open the panel and press **Refresh**, or run the
+commands above.
 
 ---
 
@@ -227,7 +309,8 @@ up but the toggle stays disabled, refresh the panel or run:
 ```
 
 Look for `forward=yes` and a non-empty `gost_pid`. If either is missing, the
-panel does not consider the tunnel usable.
+panel does not consider the tunnel usable. Also check that `relay_running=yes`;
+the system proxy points at the relay, not directly at the phone.
 
 If `system_proxy_error` is non-empty, the desktop could not read or write the
 GNOME proxy settings. The environment part may still work for Chromium, but
@@ -253,7 +336,8 @@ omarchy bar move zconnect.phone-tether --after omarchy.network
 If the panel opens but says **adb missing**, the widget's `scriptDir` does not
 contain the scripts. The default is `~/.local/share/z-connect`. Install there,
 or set the widget's `scriptDir` setting to the directory containing
-`connect.sh`, `disconnect.sh`, and `status.sh`.
+`connect.sh`, `disconnect.sh`, `status.sh`, `proxy.sh`, `relay.sh`, and
+`relay.py`.
 
 If the widget shows **Ready** but Connect fails, run the command manually to see
 the full error:
@@ -266,9 +350,13 @@ the full error:
 
 ## The tunnel works, then stops after unplugging the phone
 
-Expected. `adb forward` is tied to the USB connection. Replug the phone and run
-`./connect.sh` again. The phone-side binary stays in `/data/local/tmp`, so it
-does not need to be re-pushed.
+Expected. `adb forward` is tied to the USB connection. The relay notices that the
+phone upstream is gone and switches new connections to the normal network, so
+apps that use it keep working. The phone-side binary stays in
+`/data/local/tmp`, so it does not need to be re-pushed.
+
+Replug the phone and run `./connect.sh` again. It recreates the forward and puts
+the relay back in phone mode; open apps switch back on their next connection.
 
 If the phone rebooted, the process is gone too; `connect.sh` starts it again.
 
@@ -277,10 +365,14 @@ If the phone rebooted, the process is gone too; `connect.sh` starts it again.
 ## Everything works, but I need system-wide routing
 
 Z-Connect includes a user-level system proxy for GNOME/GIO apps and
-Chromium-based apps, but it is not a VPN. To route every packet on the desktop,
+Chromium-based apps, plus a stable relay that lets open apps switch routes
+without a restart. It is still not a VPN. To route every packet on the desktop,
 including apps that ignore proxy settings, you need root and a TUN device or
 transparent proxy. Options include `tun2socks` or `redsocks` + iptables. That is
 outside the scope of this project.
+
+The relay is also TCP-only. It rejects UDP `ASSOCIATE`, so apps that require UDP
+through the tunnel will not work through it.
 
 ---
 
@@ -290,6 +382,8 @@ outside the scope of this project.
 cd ~/.local/share/z-connect
 ./status.sh --full
 ./proxy.sh status
+./relay.sh status
+./relay.sh log
 gsettings get org.gnome.system.proxy mode
 gsettings get org.gnome.system.proxy.socks host
 gsettings get org.gnome.system.proxy.socks port

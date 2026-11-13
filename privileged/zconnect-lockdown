@@ -153,9 +153,12 @@ start_gost() {
 }
 
 remove_rules() {
-  # mangle jumps and chains
+  # mangle jumps and chains. The PREROUTING jumps carry a match, so the delete
+  # needs the full spec; a bare `-j ZCONNECT_DIV` does not match and would leave
+  # the chain referenced.
   ipt -t mangle -D OUTPUT -j ZCONNECT_OUT 2>/dev/null || true
-  ipt -t mangle -D PREROUTING -j ZCONNECT_DIV 2>/dev/null || true
+  ipt -t mangle -D PREROUTING -p tcp -m socket -j ZCONNECT_DIV 2>/dev/null || true
+  ipt -t mangle -D PREROUTING -p udp -m socket -j ZCONNECT_DIV 2>/dev/null || true
   ipt -t mangle -D PREROUTING -j ZCONNECT_PRE 2>/dev/null || true
   ipt -t filter -D INPUT -j ZCONNECT_IN 2>/dev/null || true
 
@@ -205,9 +208,9 @@ apply_rules() (
   ipt -t mangle -A ZCONNECT_OUT -m mark --mark "$ZCONNECT_GOST_MARK" -j RETURN
   # Replies from the transparent proxy must not be captured again. TCP replies
   # come from a transparent socket; UDP replies use a per-packet transparent
-  # socket. The source-address check is a second guard for forwarded clients,
-  # whose reply source is the remote destination rather than a local address.
-  ipt -t mangle -A ZCONNECT_OUT -m socket --transparent -j RETURN
+  # socket. Their source address is the remote destination rather than a local
+  # address, so a source-type check catches both. (`-m socket` cannot be used
+  # here: this kernel rejects it in the OUTPUT hook.)
   ipt -t mangle -A ZCONNECT_OUT -m addrtype ! --src-type LOCAL -j RETURN
   if [[ "$ZCONNECT_ALLOW_LAN" == "1" ]]; then
     for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do

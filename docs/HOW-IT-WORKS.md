@@ -499,8 +499,7 @@ On `apply` it:
    might install a competing default route;
 3. marks all local TCP and UDP output with `9011`, except loopback, link-local,
    multicast, LAN ranges, gost's own marked sockets, and replies from the
-   transparent proxy (detected with `-m socket --transparent` and by a
-   non-local source address);
+   transparent proxy (whose source address is not a local address);
 4. adds a `DIVERT` rule using `-m socket` so established transparent sockets are
    marked and accepted instead of being re-proxied;
 5. adds a TPROXY rule for new local and forwarded TCP and UDP, excluding gost's

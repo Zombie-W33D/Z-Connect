@@ -8,12 +8,18 @@ an ordinary user-space process on the phone instead of Android's
 tethering/RNDIS path. No root is required on either side, and the desktop does
 not need any internet of its own to bring the tunnel up.
 
+TCP **and UDP** are supported. UDP uses gost's UDP-over-TCP extension so it can
+cross the adb forward, which means games and other UDP-dependent apps work too.
+
+The system proxy can start at login, and an optional privileged helper adds
+**mandatory system-wide routing** for apps that ignore proxy settings.
+
 It also includes an optional **Omarchy bar widget** with a phone icon, a
 Connect/Disconnect panel, and live connection details.
 
 ```
 Desktop app
-    │  SOCKS5  127.0.0.1:1080  (stable local relay)
+    │  SOCKS5  127.0.0.1:1080  (stable local relay, TCP + UDP)
     ▼
 relay.py on the desktop ──► phone mode: 127.0.0.1:1081
     │                       direct mode: normal network
@@ -21,7 +27,7 @@ relay.py on the desktop ──► phone mode: 127.0.0.1:1081
 adb forward over the USB cable
     ▼
 gost running on the phone (ordinary shell process)
-    │  normal TCP sockets
+    │  normal TCP/UDP sockets
     ▼
 phone mobile data ──► internet
 ```
@@ -47,7 +53,8 @@ dead proxy. Reconnecting flips it back to the phone.
 - **No Android tethering service.** The relay is a normal app/shell process, so
   Android's hotspot/tethering entitlement path is not involved.
 - **SOCKS5, not a proprietary tunnel.** Any Linux app that understands a SOCKS
-  proxy can use it.
+  proxy can use it. TCP and UDP are both carried; UDP uses gost's UDP-over-TCP
+  extension, so it works through the adb forward.
 - **Live route switching.** A small user-level relay owns `127.0.0.1:1080`.
   Apps keep one proxy setting while the relay switches between the phone and the
   normal network. Already-open apps reroute on their next connection; only apps
@@ -57,13 +64,16 @@ dead proxy. Reconnecting flips it back to the phone.
 - **DNS resolved on the phone.** `socks5h` keeps hostname resolution on the
   phone, so the desktop needs no working DNS.
 - **User-level system proxy.** Connect can point GNOME/GIO apps and newly
-  launched Hyprland apps at the stable relay, with no root. The previous
-  settings are restored on Disconnect, and a stale proxy is cleaned up after a
-  cable pull.
+  launched Hyprland apps at the stable relay, with no root. It can start at
+  login, stays on across phone disconnects, and falls back to direct mode.
+- **Optional mandatory routing.** A one-time privileged install adds transparent
+  TCP + UDP capture with TPROXY, so apps that ignore proxy settings still use
+  the phone. No app can silently bypass the tunnel while it is enabled.
 - **One-command setup and teardown.** `connect.sh`, `disconnect.sh`, and a
   machine-readable `status.sh`.
 - **Omarchy bar widget.** Phone icon, green/amber state dot, Connect and
-  Disconnect buttons, and live details.
+  Disconnect buttons, system-proxy and mandatory-routing toggles, and live
+  details.
 - **No secrets in this repository.** No device identifiers, phone numbers, IP
   addresses, carrier names, hostnames, or user paths are committed. Runtime
   values are read from the attached phone.
@@ -133,7 +143,7 @@ system proxy so ordinary desktop apps can use the tunnel without per-app setup:
 - GNOME/GIO apps read the `org.gnome.system.proxy` `gsettings` values.
 - Newly launched apps inherit `SOCKS_SERVER`, `SOCKS_VERSION`, and `NO_PROXY`
   from the Hyprland session environment (plus the systemd/D-Bus activation
-  environment).
+  environment and `~/.config/environment.d/90-zconnect.conf`).
 - Chromium-based browsers (Chrome, Chromium, Brave, Electron apps) read
   `SOCKS_SERVER` and `SOCKS_VERSION`.
 
@@ -144,8 +154,13 @@ Brave/Chromium. Use `env.sh` or `curl --socks5-hostname` for terminal tools that
 need the traditional variables.
 
 `connect.sh` enables the system proxy automatically after a successful tunnel
-test. `disconnect.sh` restores the previous settings first, even if the cable is
-already gone. The panel's **System proxy** toggle can override either behavior.
+test, and enables it at login too. The proxy can stay on permanently: it points
+at the stable relay, which switches to direct mode when the phone is gone.
+
+`proxy.sh cleanup` is what runs after a cable pull. It keeps the proxy on and
+switches the relay to direct mode, so open apps keep working through the normal
+network. Only an explicit `proxy.sh disable` restores the previous proxy
+settings.
 
 Because the system proxy points at the stable relay, apps that already use the
 relay switch routes without a restart. Apps that were launched before the first
@@ -154,7 +169,47 @@ proxy; after that they stay pointed at the relay across phone connects and
 disconnects.
 
 This is a user-level proxy, not a VPN. It does not change routes and does not
-capture apps that ignore both `gsettings` and the Chromium SOCKS variables.
+capture apps that ignore both `gsettings` and the Chromium SOCKS variables. Use
+mandatory routing for those.
+
+### 6. Optional mandatory routing (TPROXY)
+
+The system proxy is cooperative: an app can ignore it and keep using the normal
+network. Mandatory routing closes that gap.
+
+`install.sh --privileged` installs a root-owned helper once. After that,
+`lockdown.sh enable` (or the panel toggle, or `connect.sh` automatically) starts
+a root-owned gost process as a transparent TCP and UDP proxy and installs:
+
+- an `iptables` mangle chain that marks all local TCP/UDP output,
+- a policy route that sends marked packets to a local TPROXY listener,
+- a `DIVERT` rule so established transparent sockets keep working,
+- LAN, loopback, link-local, and multicast exclusions,
+- a final drop for protocols the SOCKS tunnel cannot carry,
+- an IPv6 block, because the tunnel itself is IPv4.
+
+While mandatory routing is on, every app on the desktop uses the phone,
+including games, daemons, and apps with their own network stack. There is no
+per-app bypass. This mode needs root; there is no rootless way to capture the
+whole desktop.
+
+LAN destinations are excluded by default so printers, routers, and local
+servers keep working. To force even LAN traffic through the phone, set
+`ZCONNECT_ALLOW_LAN=0` before `install.sh --privileged` (or edit
+`/etc/zconnect/lockdown.conf` and re-run `lockdown.sh enable`).
+
+The helper is the only command allowed through a restricted sudoers entry:
+
+```text
+/usr/local/libexec/zconnect-lockdown apply|cleanup|status
+```
+
+All ports, marks, and paths come from a root-owned
+`/etc/zconnect/lockdown.conf`, never from the caller.
+
+If you use Tailscale, WireGuard, Docker, or another overlay, review
+[Limitations](#limitations): mandatory routing deliberately captures their
+traffic too, and IPv6 is blocked.
 
 ---
 
@@ -166,8 +221,11 @@ capture apps that ignore both `gsettings` and the Chromium SOCKS variables.
   `adb`).
 - `curl`.
 - `unzip` or `python3` (only for `fetch-deps.sh`).
+- `python3` for the relay.
 - Optional: GNOME/GIO `gsettings` and a Hyprland session for the user-level
   system proxy.
+- Optional: systemd user services for boot-time proxying.
+- Optional: `iptables`, `ip`, and root for mandatory routing.
 - Optional: Omarchy with the Quickshell-based shell, for the bar widget.
 
 ### Phone
@@ -180,10 +238,12 @@ capture apps that ignore both `gsettings` and the Chromium SOCKS variables.
 
 ### Not required
 
-- Root.
+- Root for the normal SOCKS5 tunnel or the user-level system proxy.
 - A hotspot/tethering add-on.
 - Wi-Fi on the desktop.
 - Any desktop internet connection.
+
+Root is only required for the optional mandatory-routing helper.
 
 ---
 
@@ -198,8 +258,10 @@ cd ~/.local/share/z-connect
 `fetch-deps.sh` downloads:
 
 - Android platform-tools, and extracts `adb` to `bin/adb`
-- the pinned `gost` release for ARM64, verifies its SHA-256 checksum, and puts
-  it in `bin/gost`
+- the pinned `gost` release for ARM64 Android, verifies its SHA-256 checksum,
+  and puts it in `bin/gost`
+- the pinned `gost` release for this desktop's architecture, verifies its
+  checksum, and puts it in `bin/gost-desktop`
 
 Then install the optional Omarchy widget:
 
@@ -214,7 +276,7 @@ Or install files without enabling the widget:
 ```
 
 The installer copies the runtime to `~/.local/share/z-connect` (unless you are
-already there) and the widget to
+already there), writes the systemd user units, and copies the widget to
 `~/.config/omarchy/plugins/zconnect.phone-tether/`.
 
 To enable it manually:
@@ -226,6 +288,30 @@ omarchy bar move zconnect.phone-tether --after omarchy.network
 
 If you already have an older local copy of this widget under a different plugin
 ID, disable it first so you do not end up with two phone icons.
+
+### Optional: mandatory routing
+
+To capture apps that ignore the system proxy, install the privileged helper
+once:
+
+```bash
+sudo ~/.local/share/z-connect/install.sh --privileged
+```
+
+This installs the root-owned helper, the desktop gost binary, a fixed
+configuration, and a restricted sudoers entry. It does not enable anything by
+itself. `connect.sh` turns mandatory routing on automatically when the helper is
+present; use `ZCONNECT_AUTO_LOCKDOWN=0` to opt out, or control it from the panel
+or `lockdown.sh`.
+
+To remove it:
+
+```bash
+sudo rm -f /usr/local/libexec/zconnect-lockdown \
+           /usr/local/libexec/zconnect-gost \
+           /etc/sudoers.d/zconnect-lockdown
+sudo rm -rf /etc/zconnect
+```
 
 ---
 
@@ -244,33 +330,37 @@ The script:
 2. starts the stable local relay on `127.0.0.1:1080` and puts it in phone mode,
 3. detects the phone's DNS servers,
 4. pushes `gost` if it is missing,
-5. restarts the phone-side SOCKS5 proxy on `127.0.0.1:1081`,
+5. restarts the phone-side SOCKS5 proxy with TCP and UDP enabled,
 6. recreates the USB port forward for `1081`,
 7. tests the phone tunnel and the relay,
-8. enables the user-level system proxy unless `ZCONNECT_AUTO_PROXY=0`.
+8. enables the user-level system proxy and login proxying unless
+   `ZCONNECT_AUTO_PROXY=0`,
+9. enables mandatory routing when the privileged helper is installed, unless
+   `ZCONNECT_AUTO_LOCKDOWN=0`.
 
 A successful run looks like:
 
 ```text
-[1/6] Starting adb and waiting for the phone...
-[2/6] Preparing the stable local relay...
-[3/6] Detecting the phone's DNS resolver...
-[4/6] Ensuring the phone-side proxy binary is present...
-[5/6] Restarting the phone-side SOCKS5 proxy...
-[6/6] Forwarding port 1081 over USB...
-
-Testing the tunnel...
+[1/7] Starting adb and waiting for the phone...
+[2/7] Preparing the stable local relay...
+[3/7] Detecting the phone's DNS resolver...
+[4/7] Ensuring the phone-side proxy binary is present...
+[5/7] Restarting the phone-side SOCKS5 proxy (TCP + UDP)...
+[6/7] Forwarding port 1081 over USB...
+[7/7] Testing the tunnel...
 
 Connected.
-  Relay endpoint: 127.0.0.1:1080
+  Relay endpoint: 127.0.0.1:1080 (TCP + UDP)
   Phone egress  : <phone public IP>
   System proxy  : on
+  Mandatory route: on
   Route switch  : apps using 127.0.0.1:1080 switch automatically
 ```
 
 If the system proxy cannot be enabled, the tunnel still works. The script prints
 a warning and you can use the panel toggle or `proxy.sh enable` after fixing the
-cause.
+cause. The same applies to mandatory routing: without the helper it is skipped
+with a warning.
 
 ### Test it manually
 
@@ -305,35 +395,67 @@ already-running browser session.
 
 ### Use the system proxy
 
-`connect.sh` turns the user-level system proxy on automatically. You can also
-control it directly:
+`connect.sh` turns the user-level system proxy on automatically and enables it at
+login. You can also control it directly:
 
 ```bash
 ./proxy.sh status    # key=value state
-./proxy.sh enable    # save the current settings and turn the proxy on
-./proxy.sh disable   # restore the previous settings
-./proxy.sh cleanup   # restore only if the tunnel is no longer up
+./proxy.sh enable    # apply now and enable at login
+./proxy.sh enable --no-boot
+                     # apply now, do not enable at login
+./proxy.sh disable   # restore the previous settings and turn login proxying off
+./proxy.sh cleanup   # keep the proxy on; switch the relay to direct when the
+                     # phone tunnel is down
+./proxy.sh boot on   # enable at login without changing the current session
+./proxy.sh boot off  # disable at login without changing the current session
 ```
 
 The panel has the same control as a **System proxy** toggle. Turning it on sets
 GNOME/GIO's manual SOCKS proxy and adds `SOCKS_SERVER`/`SOCKS_VERSION` to the
-Hyprland session environment for newly launched apps. It does not use `sudo`.
+Hyprland session environment, the systemd/D-Bus activation environment, and
+`~/.config/environment.d/90-zconnect.conf` for the next login. It does not use
+`sudo`.
 
-After enabling it, apps that were already open and using a direct connection
-need one restart so they inherit the new environment. After that they point at
-the stable relay and switch routes automatically. Newly launched apps pick it up
-immediately.
+Boot-time proxying is implemented with two systemd user units:
+
+- `zconnect-relay.service` keeps the stable relay running,
+- `zconnect-proxy.service` re-applies the proxy settings at login.
+
+Because the proxy is always safe to leave on, `cleanup` never turns it off. When
+the phone disappears, the relay switches to direct mode and apps that use it
+continue through the normal network. Run `proxy.sh disable` when you actually
+want to stop using the proxy.
 
 The previous proxy settings are saved in
 `~/.local/state/zconnect/proxy-backup.env` and restored by `proxy.sh disable`.
-If the phone disappears while the proxy is on, the panel runs `proxy.sh cleanup`
-and restores the settings automatically.
 
 To keep the tunnel but skip the automatic system proxy:
 
 ```bash
 ZCONNECT_AUTO_PROXY=0 ./connect.sh
 ```
+
+### Use mandatory routing
+
+Mandatory routing is the "no app can bypass the phone" mode:
+
+```bash
+./lockdown.sh status   # key=value state
+./lockdown.sh enable   # all TCP and UDP through the phone
+./lockdown.sh disable  # remove the rules, restore normal routing
+./lockdown.sh cleanup  # disable when the phone tunnel is down
+```
+
+It needs the helper from `install.sh --privileged`. `connect.sh` enables it
+automatically when the helper is installed. To opt out:
+
+```bash
+ZCONNECT_AUTO_LOCKDOWN=0 ./connect.sh
+```
+
+While it is on, IPv6 is blocked and non-TCP/UDP traffic is dropped so nothing
+can slip past the tunnel. See [Limitations](#limitations) for overlays and
+containers.
 
 ### Check status
 
@@ -351,11 +473,25 @@ relay_mode=phone
 relay_port=1080
 phone_port=1081
 relay_fallback_direct=1
+relay_systemd=yes
+relay_udp=yes
 system_proxy=on
 system_proxy_managed=yes
 system_proxy_mode=manual
 system_proxy_socks=127.0.0.1:1080
 system_proxy_error=
+system_proxy_boot=on
+system_proxy_env_file=yes
+system_proxy_service=active
+lockdown=on
+lockdown_helper=installed
+lockdown_gost_pid=12345
+lockdown_port=12345
+lockdown_phone_port=1081
+lockdown_mark=9011
+lockdown_allow_lan=1
+lockdown_ipv6=1
+lockdown_udp=yes
 adb_state=device
 model=...
 operator=...
@@ -378,8 +514,19 @@ bar widget to poll.
 ./disconnect.sh
 ```
 
-This stops `zconnect-gost` on the phone and removes the `adb` forward. It does
-not change the phone's mobile data settings.
+This removes mandatory routing first, switches the relay to direct mode, then
+stops `zconnect-gost` on the phone and removes the `adb` forward. It does not
+change the phone's mobile data settings.
+
+The system proxy stays on by default: it now uses the normal network through the
+relay, so apps that were using it keep working. To restore the previous proxy
+settings too:
+
+```bash
+./disconnect.sh --proxy-off
+# or
+ZCONNECT_DISCONNECT_PROXY=1 ./disconnect.sh
+```
 
 ---
 
@@ -400,13 +547,16 @@ Click the icon for a panel with:
 - battery level
 - phone model
 - SOCKS5 endpoint and current route (Phone or Direct)
+- current capture mode (all apps or proxy-aware apps)
 - a **System proxy** toggle
+- a **Mandatory routing** toggle (when the privileged helper is installed)
 - **Connect**, **Disconnect**, and **Refresh** controls
 
 The panel starts `connect.sh` / `disconnect.sh` and then runs `status.sh`.
 Its only network request is through the phone-side proxy, so it works while the
-desktop has no internet. If the cable is pulled while the system proxy is on,
-the panel restores the previous settings automatically.
+desktop has no internet. If the cable is pulled while the proxy or mandatory
+routing is on, the panel runs `proxy.sh cleanup`, which keeps the proxy on,
+switches the relay to direct mode, and removes the transparent rules.
 
 The widget can also be driven from a terminal or a Hyprland hotkey:
 
@@ -417,6 +567,10 @@ omarchy-shell zconnect.phone-tether proxyOn
 omarchy-shell zconnect.phone-tether proxyOff
 omarchy-shell zconnect.phone-tether proxyToggle
 omarchy-shell zconnect.phone-tether proxyStatus
+omarchy-shell zconnect.phone-tether lockdownOn
+omarchy-shell zconnect.phone-tether lockdownOff
+omarchy-shell zconnect.phone-tether lockdownToggle
+omarchy-shell zconnect.phone-tether lockdownStatus
 omarchy-shell zconnect.phone-tether relayStatus
 omarchy-shell zconnect.phone-tether status
 omarchy-shell shell toggle zconnect.phone-tether
@@ -424,7 +578,7 @@ omarchy-shell shell toggle zconnect.phone-tether
 
 The default script directory is `~/.local/share/z-connect`. If you installed
 elsewhere, set the widget's `scriptDir` setting to the directory containing
-`connect.sh`, `disconnect.sh`, `status.sh`, and `proxy.sh`.
+`connect.sh`, `disconnect.sh`, `status.sh`, `proxy.sh`, and `lockdown.sh`.
 
 ### Testing with no local internet
 
@@ -436,10 +590,12 @@ elsewhere, set the widget's `scriptDir` setting to the directory containing
    IP, carrier/network details, and a green dot.
 5. Confirm the **System proxy** toggle is on. Connect enables it automatically;
    if it is off, turn it on manually.
-6. If an app was already open before the first Connect, restart it once so it
+6. If the helper is installed, confirm **Mandatory routing** is on. This is what
+   makes apps that ignore proxy settings use the phone too.
+7. If an app was already open before the first Connect, restart it once so it
    picks up the system proxy. After that it points at the stable relay and
    switches routes without another restart.
-7. Unplug the phone while the app is still open. The relay switches to direct
+8. Unplug the phone while the app is still open. The relay switches to direct
    mode and the app keeps working through the normal network. Plug the phone
    back in and press Connect; the same open app switches back to the phone.
 
@@ -448,7 +604,42 @@ running — press Connect.
 
 If the panel shows `Connected` but a browser still uses the normal connection,
 restart that browser once. If it still ignores the proxy, use the included
-browser launcher or configure the app's SOCKS5 setting explicitly.
+browser launcher, turn on mandatory routing, or configure the app's SOCKS5
+setting explicitly.
+
+### Testing mandatory routing
+
+With the phone connected and mandatory routing on, these should all use the
+phone's egress IP:
+
+```bash
+curl https://api.ipify.org                 # proxy-aware
+curl --noproxy '*' https://api.ipify.org   # ignores proxy settings
+```
+
+The second command is the important one: it bypasses proxy environment
+variables and still leaves through the phone because the kernel rules capture
+it. A UDP check with the same standard SOCKS5 UDP `ASSOCIATE` that apps use:
+
+```bash
+python3 - <<'PY'
+import socket, struct
+t = socket.create_connection(("127.0.0.1", 1080), timeout=5)
+t.sendall(b"\x05\x01\x00"); t.recv(2)
+t.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
+r = t.recv(10)
+bnd = (socket.inet_ntoa(r[4:8]), struct.unpack("!H", r[8:10])[0])
+q = (b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+     b"\x07example\x03com\x00\x00\x01\x00\x01")
+pkt = b"\x00\x00\x00\x01" + socket.inet_aton("8.8.8.8") + struct.pack("!H", 53) + q
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.settimeout(6)
+u.sendto(pkt, bnd)
+print(len(u.recv(2048)), "UDP bytes")
+PY
+```
+
+If `curl --noproxy '*'` still shows the normal IP, mandatory routing is not
+active; run `./lockdown.sh status`.
 
 ---
 
@@ -462,10 +653,15 @@ browser launcher or configure the app's SOCKS5 setting explicitly.
 | `ZCONNECT_DNS` | auto-detect + public fallbacks | Comma-separated `ip:port` resolver list for gost on the phone. |
 | `ZCONNECT_WAIT` | `25` | Seconds `connect.sh` waits for the phone. |
 | `ZCONNECT_AUTO_PROXY` | `1` | Set to `0` to connect without enabling the user-level system proxy. |
+| `ZCONNECT_AUTO_LOCKDOWN` | `1` | Set to `0` to skip mandatory routing even when the helper is installed. |
+| `ZCONNECT_DISCONNECT_PROXY` | `0` | Set to `1` to restore the previous proxy settings on disconnect. |
+| `ZCONNECT_LOCKDOWN_HELPER` | `/usr/local/libexec/zconnect-lockdown` | Helper path used by `lockdown.sh`. |
+| `ZCONNECT_LOCKDOWN_STATE` | `/run/zconnect/lockdown.state` | World-readable state file written by the helper. |
 | `ADB` | auto | Path or command name for `adb`. |
 | `ZCONNECT_DIR` | `~/.local/share/z-connect` | Installer destination. |
 | `GOST_VERSION` | `v3.3.3` | gost release used by `fetch-deps.sh`. |
-| `GOST_ASSET` | `gost_3.3.3_linux_arm64.tar.gz` | gost asset for a different phone ABI. |
+| `GOST_PHONE_ASSET` | `gost_3.3.3_linux_arm64.tar.gz` | gost asset for a different phone ABI. |
+| `GOST_DESKTOP_ASSET` | host architecture | Override the desktop gost asset. |
 
 Examples:
 
@@ -475,6 +671,7 @@ ZCONNECT_PHONE_PORT=2081 ./connect.sh
 ZCONNECT_DNS="9.9.9.9:53,1.1.1.1:53" ./connect.sh
 ZCONNECT_WAIT=60 ./connect.sh
 ZCONNECT_AUTO_PROXY=0 ./connect.sh
+ZCONNECT_AUTO_LOCKDOWN=0 ./connect.sh
 ```
 
 ---
@@ -484,6 +681,9 @@ ZCONNECT_AUTO_PROXY=0 ./connect.sh
 - **Loopback only.** The desktop relay listens on `127.0.0.1:1080`, and `gost`
   listens on the phone's `127.0.0.1:1081`. The desktop reaches the phone only
   through the `adb` USB forward. There is no LAN or internet listener.
+- **Restricted privileged helper.** Mandatory routing uses one root-owned helper
+  with a fixed configuration. The sudoers entry allows only `apply`, `cleanup`,
+  and `status`; no path, port, or command comes from the caller.
 - **No credentials stored.** Z-Connect does not save passwords, tokens, or
   account data. The only local state is the optional installed scripts, the
   binaries in `bin/`, and a small proxy backup file containing the desktop's
@@ -510,26 +710,36 @@ paths. `bin/`, logs, and downloaded archives are ignored by Git.
 
 - **User-level system proxy, not a VPN.** `proxy.sh` covers apps that honor
   GNOME/GIO settings and Chromium-based apps launched after it is enabled. Apps
-  with their own proxy settings, or that ignore both, still need explicit
-  configuration. Routing the whole desktop requires root and a TUN device such
-  as `tun2socks`, or `redsocks` + iptables.
+  with their own proxy settings, or that ignore both, need mandatory routing or
+  explicit configuration.
+- **Mandatory routing needs root and captures everything.** While it is on,
+  every local TCP/UDP flow uses the phone. Tailscale, WireGuard, Docker
+  containers, and other overlays may break or lose connectivity because their
+  traffic is captured too. IPv6 is blocked. Turn it off with
+  `lockdown.sh disable` when you need those tools.
+- **Non-TCP/UDP traffic is dropped in mandatory mode.** ICMP and raw-IP
+  protocols cannot cross a SOCKS tunnel, so they are blocked rather than allowed
+  to bypass the phone.
 - **The relay switches new connections.** Existing connections that are already
   open keep using the route they started on. A browser may keep a pooled
   connection alive for a while; new tabs, requests, or a reload use the new
   route. Apps that were direct before the first Connect need one restart to
   start using the relay.
 - **The phone must stay connected.** Unplugging the cable drops the `adb`
-  forward. The relay falls back to direct mode so open apps keep working, and
-  `connect.sh` recreates the forward on the next run.
+  forward. The relay falls back to direct mode so open apps keep working,
+  `lockdown.sh cleanup` removes the transparent rules, and `connect.sh`
+  recreates the forward on the next run.
 - **USB debugging must stay enabled.** The phone-side process is started over
   ADB.
-- **Phone binary architecture matters.** The default gost asset is ARM64. See
-  [`bin/README.md`](bin/README.md) for armv7 and emulator options.
+- **Phone binary architecture matters.** The default phone gost asset is ARM64.
+  See [`bin/README.md`](bin/README.md) for armv7 and emulator options.
 - **No IPv6 DNS auto-detection.** The DNS detector currently extracts IPv4
-  servers. On an IPv6-only network, set `ZCONNECT_DNS` manually.
-- **Some apps ignore system settings.** Browsers and many CLI tools work; games,
-  daemons, and apps with their own proxy configuration may need explicit setup.
-  Chromium-based apps must be restarted once after the system proxy is first
+  servers. On an IPv6-only network, set `ZCONNECT_DNS` manually. Mandatory
+  routing blocks IPv6 egress entirely.
+- **UDP depends on gost on both ends.** The phone-side gost must run with
+  `udp=true` (the scripts do this). Apps that use raw sockets or their own
+  non-SOCKS UDP stack need mandatory routing.
+- **Chromium-based apps must be restarted once** after the system proxy is first
   enabled.
 
 ---
@@ -558,8 +768,12 @@ Common causes:
 | Proxy starts but every request fails | Mobile data off, no signal, or DNS blocked; set `ZCONNECT_DNS`. |
 | `adb: error: cannot bind listener` | Port 1081 is already in use; set `ZCONNECT_PHONE_PORT`. |
 | `relay did not open port 1080` | Port 1080 is already in use; set `ZCONNECT_PORT`, then use the same port in apps. |
-| Browser ignores the tunnel | Restart the browser once after enabling the system proxy; if it still ignores it, use the included launcher or configure the app explicitly. |
-| No internet after unplugging the phone | The relay should fall back to direct mode automatically. If the system proxy is still on, run `./proxy.sh cleanup` or `./proxy.sh disable`, or use the panel toggle. |
+| Browser ignores the tunnel | Restart the browser once after enabling the system proxy; if it still ignores it, use the included launcher, turn on mandatory routing, or configure the app explicitly. |
+| `curl --noproxy '*'` still uses the normal IP | Mandatory routing is off or the helper is not installed. Run `./lockdown.sh status` and `sudo ./install.sh --privileged`. |
+| `lockdown.sh enable` says sudo needs a password | The restricted sudoers entry is missing. Re-run `sudo ./install.sh --privileged`. |
+| Tailscale/Docker broke after Connect | Mandatory routing captures their traffic and blocks IPv6. Run `./lockdown.sh disable` when you need them. |
+| UDP app cannot connect | Confirm `relay_udp=yes` in `./relay.sh status` and `lockdown_udp=yes`; UDP needs the phone-side gost started with `udp=true`, which `connect.sh` does. |
+| No internet after unplugging the phone | The relay should fall back to direct mode automatically. If mandatory routing was on, run `./lockdown.sh cleanup`. The system proxy can stay on; run `./proxy.sh disable` only if you want to stop using it. |
 | Relay says Direct while the phone is connected | Check `./relay.sh status` and `./status.sh --quick`; press Connect again or run `./relay.sh mode phone` after the tunnel is up. |
 
 ---
@@ -586,14 +800,19 @@ Z-Connect/
 ├── connect.sh                 # start proxy + adb forward
 ├── disconnect.sh              # stop proxy + remove forward
 ├── status.sh                  # machine-readable status
-├── proxy.sh                   # user-level system proxy on/off/cleanup
+├── proxy.sh                   # system proxy on/off, boot units, cleanup
+├── lockdown.sh                # mandatory routing on/off/status
+├── relay.sh                   # manage the stable local relay
+├── relay.py                   # TCP + UDP relay
 ├── env.sh                     # export proxy variables for a shell
 ├── chromium-zconnect.sh       # browser launcher
 ├── brave-zconnect.sh          # browser launcher
-├── fetch-deps.sh              # download adb and gost
-├── install.sh                 # install scripts and Omarchy widget
+├── fetch-deps.sh              # download adb and both gost binaries
+├── install.sh                 # install scripts, widget, and optional helper
 ├── lib.sh                     # shared shell helpers
 ├── bin/README.md              # binary download notes
+├── privileged/
+│   └── zconnect-lockdown      # root-owned TPROXY helper
 ├── omarchy/
 │   └── zconnect.phone-tether/
 │       ├── manifest.json

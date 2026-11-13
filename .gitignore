@@ -1,6 +1,7 @@
 # Downloaded binaries
 /bin/adb
 /bin/gost
+/bin/gost-desktop
 /bin/*.zip
 /bin/*.tar.gz
 

@@ -45,6 +45,25 @@ else
   emit system_proxy_mode ""
   emit system_proxy_socks ""
   emit system_proxy_error "proxy.sh not found"
+  emit system_proxy_boot off
+  emit system_proxy_env_file no
+  emit system_proxy_service inactive
+fi
+
+# Mandatory routing state. The helper is root-owned; status only reads the
+# world-readable state file, so this works without sudo.
+if [[ -x "$HERE/lockdown.sh" ]]; then
+  "$HERE/lockdown.sh" status 2>/dev/null || true
+else
+  emit lockdown off
+  emit lockdown_helper missing
+  emit lockdown_gost_pid ""
+  emit lockdown_port ""
+  emit lockdown_phone_port ""
+  emit lockdown_mark ""
+  emit lockdown_allow_lan ""
+  emit lockdown_ipv6 ""
+  emit lockdown_udp yes
 fi
 
 ADB="$(zconnect_adb)" || {

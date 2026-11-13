@@ -4,13 +4,15 @@
 # Apps point at one fixed local port. The relay sends new connections through
 # the phone when the mode is "phone", and through the normal network when it is
 # "direct". If the phone disappears, phone mode falls back to the normal
-# network so open apps keep working.
+# network so open apps keep working. TCP and UDP are both supported; UDP uses
+# gost's UDP-over-TCP extension so it can cross the adb forward.
 #
 # Commands:
 #   relay.sh start
 #   relay.sh stop
 #   relay.sh restart
 #   relay.sh ensure
+#   relay.sh run            (foreground, used by the systemd user unit)
 #   relay.sh mode phone|direct
 #   relay.sh status
 #   relay.sh cleanup
@@ -28,7 +30,8 @@ PIDFILE="$STATE_DIR/relay.pid"
 MODEFILE="$STATE_DIR/relay-mode"
 LOGFILE="$STATE_DIR/relay.log"
 LOCKFILE="$STATE_DIR/relay.lock"
-FALLBACK_DIRECT="${ZCONNECT_RELAY_FALLBACK_DIRECT:-1}"
+FALLBACK_DIRECT="$ZCONNECT_RELAY_FALLBACK_DIRECT"
+SYSTEMD_UNIT="${ZCONNECT_RELAY_UNIT:-zconnect-relay.service}"
 
 mkdir -p "$STATE_DIR" 2>/dev/null || true
 chmod 700 "$STATE_DIR" 2>/dev/null || true
@@ -43,9 +46,24 @@ lock_state() {
   fi
 }
 
+have_systemd_unit() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  systemctl --user cat "$SYSTEMD_UNIT" >/dev/null 2>&1
+}
+
+systemd_active() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  systemctl --user is-active --quiet "$SYSTEMD_UNIT" 2>/dev/null
+}
+
 relay_pid() {
   local pid
-  pid="$(cat "$PIDFILE" 2>/dev/null)" || return 1
+  pid="$(cat "$PIDFILE" 2>/dev/null)" || pid=""
+  if [[ ! "$pid" =~ ^[0-9]+$ ]] || ! kill -0 "$pid" 2>/dev/null; then
+    if systemd_active; then
+      pid="$(systemctl --user show -p MainPID --value "$SYSTEMD_UNIT" 2>/dev/null)"
+    fi
+  fi
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
   tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q 'relay.py' || return 1
@@ -80,6 +98,28 @@ write_mode() {
   mv "$tmp" "$MODEFILE" || return 1
 }
 
+wait_for_port() {
+  local pid="${1:-}"
+  for _ in $(seq 1 30); do
+    if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+      echo "error: the relay exited during startup. Recent log:" >&2
+      tail -n 10 "$LOGFILE" >&2 || true
+      rm -f "$PIDFILE"
+      return 1
+    fi
+    if port_listening; then
+      echo "Relay started on 127.0.0.1:${RELAY_PORT} (phone upstream 127.0.0.1:${PHONE_PORT})."
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "error: the relay did not open port ${RELAY_PORT}. Recent log:" >&2
+  tail -n 10 "$LOGFILE" >&2 || true
+  [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+  rm -f "$PIDFILE"
+  return 1
+}
+
 start_relay() {
   local pid fallback_args=()
 
@@ -102,39 +142,34 @@ start_relay() {
     return 1
   fi
 
+  if have_systemd_unit; then
+    if systemctl --user start "$SYSTEMD_UNIT" 2>/dev/null; then
+      wait_for_port ""
+      return $?
+    fi
+    echo "warning: could not start $SYSTEMD_UNIT; falling back to a background process." >&2
+  fi
+
   [[ "$FALLBACK_DIRECT" == "0" ]] && fallback_args+=(--no-fallback-direct)
 
   nohup python3 -u "$HERE/relay.py" \
     --listen "127.0.0.1:${RELAY_PORT}" \
     --upstream "127.0.0.1:${PHONE_PORT}" \
     --mode-file "$MODEFILE" \
+    --pid-file "$PIDFILE" \
     "${fallback_args[@]}" >> "$LOGFILE" 2>&1 9>&- &
   pid=$!
-  printf '%s\n' "$pid" > "$PIDFILE"
-
-  for _ in $(seq 1 30); do
-    if ! kill -0 "$pid" 2>/dev/null; then
-      echo "error: the relay exited during startup. Recent log:" >&2
-      tail -n 10 "$LOGFILE" >&2 || true
-      rm -f "$PIDFILE"
-      return 1
-    fi
-    if port_listening; then
-      echo "Relay started on 127.0.0.1:${RELAY_PORT} (phone upstream 127.0.0.1:${PHONE_PORT})."
-      return 0
-    fi
-    sleep 0.1
-  done
-
-  echo "error: the relay did not open port ${RELAY_PORT}. Recent log:" >&2
-  tail -n 10 "$LOGFILE" >&2 || true
-  kill "$pid" 2>/dev/null || true
-  rm -f "$PIDFILE"
-  return 1
+  wait_for_port "$pid"
 }
 
 stop_relay() {
   local pid
+  if have_systemd_unit && systemd_active; then
+    systemctl --user stop "$SYSTEMD_UNIT" 2>/dev/null || true
+    rm -f "$PIDFILE"
+    echo "Relay stopped."
+    return 0
+  fi
   if ! pid="$(relay_pid)"; then
     rm -f "$PIDFILE"
     echo "Relay is not running."
@@ -153,22 +188,48 @@ stop_relay() {
   echo "Relay stopped."
 }
 
+restart_relay() {
+  if have_systemd_unit; then
+    if systemctl --user restart "$SYSTEMD_UNIT" 2>/dev/null; then
+      wait_for_port ""
+      return $?
+    fi
+    echo "warning: could not restart $SYSTEMD_UNIT; restarting a background process." >&2
+  fi
+  stop_relay
+  start_relay
+}
+
+run_foreground() {
+  local fallback_args=()
+  [[ "$FALLBACK_DIRECT" == "0" ]] && fallback_args+=(--no-fallback-direct)
+  exec python3 -u "$HERE/relay.py" \
+    --listen "127.0.0.1:${RELAY_PORT}" \
+    --upstream "127.0.0.1:${PHONE_PORT}" \
+    --mode-file "$MODEFILE" \
+    --pid-file "$PIDFILE" \
+    "${fallback_args[@]}"
+}
+
 cmd_status() {
-  local pid="" running="no" mode
+  local pid="" running="no" mode systemd="no"
   if pid="$(relay_pid)"; then
     running="yes"
   fi
   mode="$(read_mode)"
+  systemd_active && systemd="yes"
   printf 'relay_running=%s\n' "$running"
   printf 'relay_pid=%s\n' "$pid"
   printf 'relay_mode=%s\n' "$mode"
   printf 'relay_port=%s\n' "$RELAY_PORT"
   printf 'phone_port=%s\n' "$PHONE_PORT"
   printf 'relay_fallback_direct=%s\n' "$FALLBACK_DIRECT"
+  printf 'relay_systemd=%s\n' "$systemd"
+  printf 'relay_udp=yes\n'
 }
 
 cmd_cleanup() {
-  local mode output forward gost
+  local mode
   if ! is_running; then
     echo "Relay is not running."
     return 0
@@ -179,10 +240,7 @@ cmd_cleanup() {
     return 0
   }
 
-  output="$("$HERE/status.sh" --quick 2>/dev/null || true)"
-  forward="$(printf '%s\n' "$output" | awk -F= '$1 == "forward" { print $2; exit }')"
-  gost="$(printf '%s\n' "$output" | awk -F= '$1 == "gost_pid" { print $2; exit }')"
-  if [[ "$forward" == "yes" && -n "$gost" ]]; then
+  if zconnect_tunnel_up; then
     echo "Relay is in phone mode and the tunnel is up."
     return 0
   fi
@@ -193,8 +251,16 @@ cmd_cleanup() {
 case "${1:-status}" in
   start) lock_state || exit 1; start_relay ;;
   stop) lock_state || exit 1; stop_relay ;;
-  restart) lock_state || exit 1; stop_relay; start_relay ;;
-  ensure) lock_state || exit 1; start_relay ;;
+  restart) lock_state || exit 1; restart_relay ;;
+  ensure)
+    lock_state || exit 1
+    if is_running; then
+      echo "Relay is already running."
+    else
+      start_relay
+    fi
+    ;;
+  run) run_foreground ;;
   mode)
     lock_state || exit 1
     write_mode "${2:-}"
@@ -204,7 +270,7 @@ case "${1:-status}" in
   cleanup) lock_state || exit 1; cmd_cleanup ;;
   log) tail -n 50 "$LOGFILE" 2>/dev/null || true ;;
   *)
-    echo "usage: $0 {start|stop|restart|ensure|mode phone|mode direct|status|cleanup|log}" >&2
+    echo "usage: $0 {start|stop|restart|ensure|run|mode phone|mode direct|status|cleanup|log}" >&2
     exit 2
     ;;
 esac

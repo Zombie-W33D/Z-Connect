@@ -29,6 +29,7 @@ Panel {
   readonly property string connectScript: scriptDir + "/connect.sh"
   readonly property string disconnectScript: scriptDir + "/disconnect.sh"
   readonly property string proxyScript: scriptDir + "/proxy.sh"
+  readonly property string lockdownScript: scriptDir + "/lockdown.sh"
 
   // ------------------------------------------------------------------ theme
   readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
@@ -43,16 +44,21 @@ Panel {
   property var details: ({})
   property string action: ""            // "" | "connect" | "disconnect"
   property string proxyAction: ""       // "" | "enable" | "disable"
+  property string lockdownAction: ""    // "" | "enable" | "disable"
   property string errorText: ""
   property string statusError: ""
   property string actionStdout: ""
   property string actionStderr: ""
   property string proxyStdout: ""
   property string proxyStderr: ""
+  property string lockdownStdout: ""
+  property string lockdownStderr: ""
   property bool cleanupRunning: false
+  property bool cleanupDone: false
 
   readonly property bool busy: action !== ""
   readonly property bool proxyBusy: proxyAction !== ""
+  readonly property bool lockdownBusy: lockdownAction !== ""
 
   readonly property string adbState: String(details.adb_state || "disconnected")
   readonly property bool phonePresent: adbState === "device"
@@ -69,6 +75,16 @@ Panel {
   readonly property string relayMode: String(details.relay_mode || "")
   readonly property bool relayRunning: details.relay_running === "yes"
   readonly property string relayLabel: relayMode === "phone" ? "Phone" : (relayMode === "direct" ? "Direct" : "—")
+
+  readonly property bool lockdownOn: details.lockdown === "on"
+  readonly property bool lockdownHelper: details.lockdown_helper === "installed"
+  readonly property bool lockdownUdp: details.lockdown_udp === "yes"
+  readonly property string lockdownPort: String(details.lockdown_port || "")
+  readonly property string lockdownLabel: {
+    if (lockdownOn) return "All apps"
+    if (!lockdownHelper) return "Not installed"
+    return "Proxy-aware apps"
+  }
 
   readonly property string egressIp: String(details.egress_ip || "")
   readonly property string carrier: String(details.operator || "")
@@ -101,7 +117,7 @@ Panel {
       if (cleanupRunning)
         return "The phone disconnected. Restoring the normal internet settings…"
       if (systemProxyOn)
-        return "The system proxy is still on but the tunnel is down. Turn it off to restore normal internet."
+        return "The tunnel is down. The system proxy stays on and the relay uses the normal network."
       if (relayRunning && relayMode === "direct")
         return "The relay is in direct mode. Open apps using it now use the normal network."
       if (!forwardPresent && gostPid === "")
@@ -134,6 +150,7 @@ Panel {
       var ip = egressIp
       return "Phone tether connected"
         + (systemProxyOn ? " — system proxy on" : "")
+        + (lockdownOn ? " — all apps" : "")
         + (relayMode !== "" ? " — " + relayLabel + " route" : "")
         + (ip !== "" ? " — " + ip : "")
     }
@@ -166,14 +183,15 @@ Panel {
     details = parsed
     statusError = ""
 
-    // If the cable was pulled while the system proxy was on, restore the
-    // previous settings automatically. This is what keeps a stale SOCKS proxy
-    // from making the desktop look offline after the phone is gone.
-    if (parsed.system_proxy_managed === "yes") {
+    // If the cable was pulled while the proxy or mandatory routing was on,
+    // clean up automatically. proxy.sh cleanup keeps the proxy on and switches
+    // the relay to direct mode, so apps that use it keep working.
+    if (parsed.system_proxy_managed === "yes" || parsed.lockdown === "on") {
       var phone = parsed.adb_state === "device"
       var forward = parsed.forward === "yes"
       var gost = String(parsed.gost_pid || "") !== ""
-      if (!phone || !forward || !gost) startCleanup()
+      if (phone && forward && gost) cleanupDone = false
+      if ((!phone || !forward || !gost) && !cleanupDone) startCleanup()
     }
   }
 
@@ -186,7 +204,7 @@ Panel {
   }
 
   function startCleanup() {
-    if (cleanupRunning || busy || proxyBusy) return
+    if (cleanupRunning || busy || proxyBusy || lockdownBusy) return
     cleanupRunning = true
     cleanupProc.command = [proxyScript, "cleanup"]
     cleanupProc.running = true
@@ -249,6 +267,42 @@ Panel {
     refresh(true)
   }
 
+  function setLockdown(on) {
+    if (busy || proxyBusy || lockdownBusy) return
+    if (on && !tunnelUp) {
+      errorText = "Connect the phone before enabling mandatory routing."
+      return
+    }
+    if (!lockdownHelper) {
+      errorText = "Mandatory routing needs the privileged helper. Run install.sh --privileged."
+      return
+    }
+    if (on === lockdownOn) return
+
+    lockdownAction = on ? "enable" : "disable"
+    errorText = ""
+    lockdownStdout = ""
+    lockdownStderr = ""
+    lockdownProc.command = [lockdownScript, on ? "enable" : "disable"]
+    lockdownProc.running = true
+  }
+
+  function finishLockdownAction(code) {
+    var kind = lockdownAction
+    lockdownAction = ""
+    if (code !== 0) {
+      var message = pickOutputError(lockdownStderr, lockdownStdout)
+      if (message === "")
+        message = kind === "enable"
+          ? "Could not enable mandatory routing. Reinstall the helper with install.sh --privileged."
+          : "Could not disable mandatory routing."
+      errorText = message
+    } else {
+      errorText = ""
+    }
+    refresh(true)
+  }
+
   function pickError() {
     return pickOutputError(actionStderr, actionStdout)
   }
@@ -292,6 +346,10 @@ Panel {
     function proxyOff(): void { root.setSystemProxy(false) }
     function proxyToggle(): void { root.setSystemProxy(!root.systemProxyOn) }
     function proxyStatus(): string { return root.systemProxyOn ? "on" : "off" }
+    function lockdownOn(): void { root.setLockdown(true) }
+    function lockdownOff(): void { root.setLockdown(false) }
+    function lockdownToggle(): void { root.setLockdown(!root.lockdownOn) }
+    function lockdownStatus(): string { return root.lockdownOn ? "on" : "off" }
     function relayStatus(): string { return root.relayMode }
     function refresh(): void { root.refresh(true) }
     function status(): string {
@@ -363,6 +421,24 @@ Panel {
   }
 
   Process {
+    id: lockdownProc
+    command: []
+    running: false
+
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.lockdownStdout = text
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.lockdownStderr = text
+    }
+    onExited: function(code) {
+      Qt.callLater(function() { root.finishLockdownAction(code) })
+    }
+  }
+
+  Process {
     id: cleanupProc
     command: []
     running: false
@@ -380,11 +456,11 @@ Panel {
     onExited: function(code) {
       Qt.callLater(function() {
         root.cleanupRunning = false
-        if (code === 0) {
-          root.setProxyDetails(false)
-        } else {
-          root.errorText = "Could not restore the previous system proxy settings."
+        root.cleanupDone = true
+        if (code !== 0) {
+          root.errorText = "Could not clean up after the phone disconnected."
         }
+        // The proxy deliberately stays on: the relay is now in direct mode.
         root.refresh(false)
       })
     }
@@ -492,6 +568,7 @@ Panel {
         InfoRow { label: "Device"; value: root.phoneModel }
         InfoRow { label: "SOCKS5"; value: "127.0.0.1:" + root.proxyPort }
         InfoRow { label: "Route"; value: root.relayLabel }
+        InfoRow { label: "Capture"; value: root.lockdownLabel }
       }
 
       PanelSeparator {
@@ -518,6 +595,28 @@ Panel {
         opacity: (!root.busy && !root.proxyBusy && (root.tunnelUp || root.systemProxyOn)) ? 1.0 : 0.55
         enabled: !root.busy && !root.proxyBusy && (root.tunnelUp || root.systemProxyOn)
         onClicked: root.setSystemProxy(!root.systemProxyOn)
+      }
+
+      Toggle {
+        width: parent.width
+        label: "Mandatory routing"
+        description: root.lockdownBusy
+          ? (root.lockdownAction === "enable"
+              ? "Enabling — installing transparent TCP and UDP capture…"
+              : "Removing the transparent routing rules…")
+          : (!root.lockdownHelper
+              ? "Optional. Install the privileged helper once with install.sh --privileged."
+              : (root.lockdownOn
+                  ? "On — every app, including ones that ignore proxies, uses the phone (TCP + UDP)."
+                  : "Off — only apps that honor the system proxy use the phone."))
+        checked: root.lockdownBusy ? root.lockdownAction === "enable" : root.lockdownOn
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        opacity: (!root.busy && !root.proxyBusy && !root.lockdownBusy
+                  && root.lockdownHelper && (root.tunnelUp || root.lockdownOn)) ? 1.0 : 0.55
+        enabled: !root.busy && !root.proxyBusy && !root.lockdownBusy
+                 && root.lockdownHelper && (root.tunnelUp || root.lockdownOn)
+        onClicked: root.setLockdown(!root.lockdownOn)
       }
 
       PanelSeparator {

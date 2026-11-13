@@ -79,10 +79,10 @@ adb shell cat /data/local/tmp/zconnect-gost.log
 Common messages:
 
 - `exec format error` — the binary is for the wrong CPU architecture. Download
-  the correct asset with `GOST_ASSET=... ./fetch-deps.sh --force`.
+  the correct asset with `GOST_PHONE_ASSET=... ./fetch-deps.sh --force`.
 - `address already in use` — another process is using the port on the phone.
-  Kill it with `adb shell pkill -f zconnect-gost`, or change
-  `ZCONNECT_PORT`.
+  Stop it with `adb shell 'for p in $(pidof zconnect-gost) $(pidof gost); do kill $p; done'`,
+  or change `ZCONNECT_PHONE_PORT`.
 - `permission denied` — the binary was pushed without the executable bit.
   `connect.sh` normally handles this; run
   `adb shell chmod 755 /data/local/tmp/zconnect-gost`.
@@ -149,6 +149,10 @@ source ./env.sh
 ```
 
 `ZCONNECT_PHONE_PORT` defaults to the relay port plus one.
+
+Mandatory routing also uses TCP/UDP port `12345` for TPROXY. If that port is in
+use, change `ZCONNECT_TPROXY_PORT` before running `install.sh --privileged`
+(the helper reads it from `/etc/zconnect/lockdown.conf`).
 
 ---
 
@@ -267,35 +271,41 @@ phone is unreachable, start it with `--no-fallback-direct` or set
 
 ---
 
-## No internet after unplugging the phone (stale system proxy)
+## No internet after unplugging the phone
 
-If the desktop cannot reach the internet after the phone is gone, the system
-proxy may still be pointing at the dead tunnel. The relay should already be in
-direct mode, so apps using it fall back automatically. Restore the proxy
-settings as well:
+Expected behavior: the relay notices that the phone upstream is gone and
+switches new connections to the normal network, so apps that use it keep working.
+The system proxy deliberately stays on and now uses the normal network through
+the relay.
+
+If mandatory routing was on, its transparent rules must be removed, because they
+would otherwise pin all traffic to a dead phone:
 
 ```bash
 cd ~/.local/share/z-connect
-./proxy.sh cleanup
-# or force it:
-./proxy.sh disable
+./lockdown.sh cleanup   # only acts when the phone tunnel is down
+./proxy.sh cleanup      # keeps the proxy on; also calls lockdown cleanup
 ```
 
-`cleanup` only acts when the tunnel is down, so it is safe to run at any time.
-`disable` restores the saved settings unconditionally.
+Only run `./proxy.sh disable` if you actually want to restore the previous proxy
+settings and stop using the relay:
+
+```bash
+./proxy.sh disable
+```
 
 Check the result:
 
 ```bash
 ./proxy.sh status
 ./relay.sh status
+./lockdown.sh status
 gsettings get org.gnome.system.proxy mode
 ```
 
-`proxy.sh disable` and `cleanup` both put the relay in direct mode. The panel
-does this automatically when it sees `system_proxy_managed=yes` while the tunnel
-is down. If it does not, open the panel and press **Refresh**, or run the
-commands above.
+The panel does this automatically when it sees a managed proxy or active
+lockdown while the tunnel is down. If it does not, open the panel and press
+**Refresh**, or run the commands above.
 
 ---
 
@@ -336,8 +346,8 @@ omarchy bar move zconnect.phone-tether --after omarchy.network
 If the panel opens but says **adb missing**, the widget's `scriptDir` does not
 contain the scripts. The default is `~/.local/share/z-connect`. Install there,
 or set the widget's `scriptDir` setting to the directory containing
-`connect.sh`, `disconnect.sh`, `status.sh`, `proxy.sh`, `relay.sh`, and
-`relay.py`.
+`connect.sh`, `disconnect.sh`, `status.sh`, `proxy.sh`, `lockdown.sh`,
+`relay.sh`, and `relay.py`.
 
 If the widget shows **Ready** but Connect fails, run the command manually to see
 the full error:
@@ -364,15 +374,123 @@ If the phone rebooted, the process is gone too; `connect.sh` starts it again.
 
 ## Everything works, but I need system-wide routing
 
-Z-Connect includes a user-level system proxy for GNOME/GIO apps and
-Chromium-based apps, plus a stable relay that lets open apps switch routes
-without a restart. It is still not a VPN. To route every packet on the desktop,
-including apps that ignore proxy settings, you need root and a TUN device or
-transparent proxy. Options include `tun2socks` or `redsocks` + iptables. That is
-outside the scope of this project.
+Z-Connect includes an optional mandatory-routing mode. Install the privileged
+helper once:
 
-The relay is also TCP-only. It rejects UDP `ASSOCIATE`, so apps that require UDP
-through the tunnel will not work through it.
+```bash
+sudo ~/.local/share/z-connect/install.sh --privileged
+```
+
+Then enable it:
+
+```bash
+cd ~/.local/share/z-connect
+./lockdown.sh enable
+./lockdown.sh status
+```
+
+`connect.sh` enables it automatically after that. While it is on, every local
+TCP and UDP flow uses the phone, including apps that ignore proxy settings.
+`curl --noproxy '*' https://api.ipify.org` should still print the phone's IP.
+
+If you do not want it, run `./lockdown.sh disable` or connect with
+`ZCONNECT_AUTO_LOCKDOWN=0`.
+
+Mandatory routing requires root, blocks IPv6, drops non-TCP/UDP traffic, and
+captures overlays such as Tailscale, WireGuard, and Docker. Turn it off when you
+need those tools.
+
+UDP works through both modes. The phone-side gost runs with `udp=true`; check
+`relay_udp=yes` in `./relay.sh status` and `lockdown_udp=yes` in
+`./lockdown.sh status`.
+
+---
+
+## Mandatory routing will not enable
+
+Check the helper and the state file:
+
+```bash
+ls -l /usr/local/libexec/zconnect-lockdown /etc/zconnect/lockdown.conf
+cat /run/zconnect/lockdown.state 2>/dev/null
+sudo -n /usr/local/libexec/zconnect-lockdown status
+```
+
+Common causes:
+
+- **Helper not installed.** Run
+  `sudo ~/.local/share/z-connect/install.sh --privileged`. This needs
+  `bin/gost-desktop`; run `./fetch-deps.sh` first.
+- **sudo asks for a password.** The restricted sudoers entry is missing or names
+  a different user. Reinstall the helper from the same account you use.
+- **`iptables` missing.** Install your distribution's `iptables` package.
+- **gost fails to start.** Read `/run/zconnect/gost.log`. The usual cause is
+  that the phone tunnel is not up, or another process owns port `12345`.
+- **IPv6 is blocked and something broke.** That is expected. Disable mandatory
+  routing while you need IPv6 or an overlay.
+
+To clean up manually:
+
+```bash
+./lockdown.sh disable
+# or, as root:
+sudo /usr/local/libexec/zconnect-lockdown cleanup
+```
+
+---
+
+## The system proxy is not on at login
+
+Check the units and the environment file:
+
+```bash
+./proxy.sh status
+systemctl --user status zconnect-relay.service zconnect-proxy.service
+systemctl --user is-enabled zconnect-relay.service zconnect-proxy.service
+cat ~/.config/environment.d/90-zconnect.conf
+```
+
+Expected status fields:
+
+```text
+system_proxy=on
+system_proxy_boot=on
+system_proxy_env_file=yes
+system_proxy_service=active
+```
+
+If `system_proxy_boot=off`, run:
+
+```bash
+./proxy.sh boot on
+```
+
+If the units are missing, reinstall the scripts (`./install.sh`) or run
+`./proxy.sh boot on`, which writes them again. The proxy is safe to leave on:
+when the phone is gone the relay uses the normal network.
+
+---
+
+## UDP does not work
+
+Check both ends:
+
+```bash
+cd ~/.local/share/z-connect
+./relay.sh status          # relay_udp=yes
+./lockdown.sh status       # lockdown_udp=yes
+adb shell cat /data/local/tmp/zconnect-gost.log
+```
+
+The phone-side command must include `udp=true`; `connect.sh` adds it. If you
+started gost manually, restart it with:
+
+```bash
+adb shell "cd /data/local/tmp && (nohup ./zconnect-gost -L 'socks5://127.0.0.1:1081?udp=true' > zconnect-gost.log 2>&1 &)"
+```
+
+Some apps use raw sockets or a non-SOCKS UDP stack. Those need mandatory
+routing; the user-level proxy cannot capture them.
 
 ---
 
@@ -384,9 +502,12 @@ cd ~/.local/share/z-connect
 ./proxy.sh status
 ./relay.sh status
 ./relay.sh log
+./lockdown.sh status
+cat /run/zconnect/gost.log 2>/dev/null
 gsettings get org.gnome.system.proxy mode
 gsettings get org.gnome.system.proxy.socks host
 gsettings get org.gnome.system.proxy.socks port
+systemctl --user status zconnect-relay.service zconnect-proxy.service
 adb devices
 adb forward --list
 adb shell cat /data/local/tmp/zconnect-gost.log

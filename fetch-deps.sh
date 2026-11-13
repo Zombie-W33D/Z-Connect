@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Download the two binaries Z-Connect needs into ./bin:
+# Download the three binaries Z-Connect needs into ./bin:
 #
-#   bin/adb    Android platform-tools (Linux x86_64 desktop)
-#   bin/gost   gost proxy, built for the phone (ARM64 by default)
+#   bin/adb           Android platform-tools (Linux desktop)
+#   bin/gost          gost proxy, built for the phone (ARM64 by default)
+#   bin/gost-desktop  gost proxy, built for this desktop (used by TPROXY)
 #
 # Nothing is installed system-wide. Run this once after cloning.
 set -euo pipefail
@@ -14,10 +15,22 @@ FORCE=0
 
 GOST_VERSION="${GOST_VERSION:-v3.3.3}"
 GOST_VERSION="v${GOST_VERSION#v}"
-GOST_ASSET="${GOST_ASSET:-gost_${GOST_VERSION#v}_linux_arm64.tar.gz}"
-GOST_URL="https://github.com/go-gost/gost/releases/download/${GOST_VERSION}/${GOST_ASSET}"
-CHECKSUMS_URL="https://github.com/go-gost/gost/releases/download/${GOST_VERSION}/checksums.txt"
+GOST_RELEASE="${GOST_VERSION#v}"
+GOST_BASE="https://github.com/go-gost/gost/releases/download/${GOST_VERSION}"
+CHECKSUMS_URL="${GOST_BASE}/checksums.txt"
 PLATFORM_TOOLS_URL="https://dl.google.com/android/repository/platform-tools-latest-linux.zip"
+
+# The phone is almost always ARM64. The desktop binary must match this host so
+# the privileged TPROXY helper can execute it.
+PHONE_ASSET="${GOST_PHONE_ASSET:-gost_${GOST_RELEASE}_linux_arm64.tar.gz}"
+case "$(uname -m)" in
+  x86_64|amd64) HOST_ARCH="amd64" ;;
+  aarch64|arm64) HOST_ARCH="arm64" ;;
+  armv7l|armv6l) HOST_ARCH="armv7" ;;
+  i386|i686) HOST_ARCH="386" ;;
+  *) HOST_ARCH="$(uname -m)" ;;
+esac
+DESKTOP_ASSET="${GOST_DESKTOP_ASSET:-gost_${GOST_RELEASE}_linux_${HOST_ARCH}.tar.gz}"
 
 need() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -27,6 +40,8 @@ need() {
 }
 
 need curl
+need sha256sum
+need tar
 
 mkdir -p "$BIN"
 TMP="$(mktemp -d)"
@@ -53,30 +68,47 @@ else
 fi
 
 # ------------------------------------------------------------------ gost
-if [[ -x "$BIN/gost" && "$FORCE" == "0" ]]; then
-  echo "gost already present: $BIN/gost"
+# One checksums file covers every asset in the release.
+if [[ -x "$BIN/gost" && -x "$BIN/gost-desktop" && "$FORCE" == "0" ]]; then
+  echo "gost already present: $BIN/gost and $BIN/gost-desktop"
 else
-  echo "Downloading gost ${GOST_VERSION} (${GOST_ASSET})..."
-  curl -fL --retry 3 -o "$TMP/gost.tar.gz" "$GOST_URL"
+  echo "Downloading gost ${GOST_VERSION} checksums..."
   curl -fL --retry 3 -o "$TMP/checksums.txt" "$CHECKSUMS_URL"
+fi
 
-  expected="$(awk -v f="$GOST_ASSET" '$2 == f { print $1; exit }' "$TMP/checksums.txt")"
-  if [[ -z "$expected" ]]; then
-    echo "error: checksum for $GOST_ASSET not found." >&2
-    exit 1
+download_gost() {
+  local name="$1" asset="$2" dest="$3"
+  local expected actual
+
+  if [[ -x "$dest" && "$FORCE" == "0" ]]; then
+    echo "gost already present: $dest"
+    return 0
   fi
-  actual="$(sha256sum "$TMP/gost.tar.gz" | awk '{ print $1 }')"
+
+  echo "Downloading gost ${GOST_VERSION} (${asset})..."
+  curl -fL --retry 3 -o "$TMP/${name}.tar.gz" "${GOST_BASE}/${asset}"
+
+  expected="$(awk -v f="$asset" '$2 == f { print $1; exit }' "$TMP/checksums.txt")"
+  if [[ -z "$expected" ]]; then
+    echo "error: checksum for $asset not found." >&2
+    return 1
+  fi
+  actual="$(sha256sum "$TMP/${name}.tar.gz" | awk '{ print $1 }')"
   if [[ "$actual" != "$expected" ]]; then
-    echo "error: checksum mismatch for $GOST_ASSET." >&2
+    echo "error: checksum mismatch for $asset." >&2
     echo "  expected $expected" >&2
     echo "  actual   $actual" >&2
-    exit 1
+    return 1
   fi
 
-  tar -xzf "$TMP/gost.tar.gz" -C "$TMP" gost
-  install -m 0755 "$TMP/gost" "$BIN/gost"
-  echo "Installed $BIN/gost"
-fi
+  tar -xzf "$TMP/${name}.tar.gz" -C "$TMP" gost
+  install -m 0755 "$TMP/gost" "$dest"
+  rm -f "$TMP/gost"
+  echo "Installed $dest"
+}
+
+download_gost phone "$PHONE_ASSET" "$BIN/gost"
+download_gost desktop "$DESKTOP_ASSET" "$BIN/gost-desktop"
 
 echo
 echo "Dependencies are ready. Next:"
@@ -84,3 +116,6 @@ echo "  ./connect.sh"
 echo
 echo "For an Omarchy bar widget, run:"
 echo "  ./install.sh --enable"
+echo
+echo "For mandatory system-wide routing, install the privileged helper once:"
+echo "  sudo ./install.sh --privileged"

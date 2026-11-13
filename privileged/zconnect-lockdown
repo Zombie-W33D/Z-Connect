@@ -1,0 +1,365 @@
+#!/usr/bin/env bash
+# zconnect-lockdown - privileged helper for Z-Connect mandatory routing.
+#
+# Installed as /usr/local/libexec/zconnect-lockdown, root-owned. The only
+# commands the desktop user may run through sudo are:
+#
+#   zconnect-lockdown apply
+#   zconnect-lockdown cleanup
+#   zconnect-lockdown status
+#
+# The helper reads /etc/zconnect/lockdown.conf, which is also root-owned. No
+# path, port, or command is taken from the caller.
+set -euo pipefail
+
+CONF="${ZCONNECT_LOCKDOWN_CONF:-/etc/zconnect/lockdown.conf}"
+
+if [[ ! -r "$CONF" ]]; then
+  echo "error: missing $CONF" >&2
+  exit 1
+fi
+# shellcheck source=/dev/null
+source "$CONF"
+
+: "${ZCONNECT_MARK:=9011}"
+: "${ZCONNECT_GOST_MARK:=9012}"
+: "${ZCONNECT_TABLE:=9011}"
+: "${ZCONNECT_TPROXY_PORT:=12345}"
+: "${ZCONNECT_PHONE_PORT:=1081}"
+: "${ZCONNECT_GOST:=/usr/local/libexec/zconnect-gost}"
+: "${ZCONNECT_RUN_DIR:=/run/zconnect}"
+: "${ZCONNECT_ALLOW_LAN:=1}"
+: "${ZCONNECT_BLOCK_IPV6:=1}"
+
+STATE="$ZCONNECT_RUN_DIR/lockdown.state"
+PIDFILE="$ZCONNECT_RUN_DIR/gost.pid"
+LOG="$ZCONNECT_RUN_DIR/gost.log"
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+need_root() {
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "this helper must run as root"
+}
+
+validate() {
+  local name
+  for name in ZCONNECT_MARK ZCONNECT_GOST_MARK ZCONNECT_TABLE \
+              ZCONNECT_TPROXY_PORT ZCONNECT_PHONE_PORT; do
+    [[ "${!name}" =~ ^[0-9]+$ ]] || die "$name must be numeric"
+  done
+  [[ "$ZCONNECT_GOST" == /* ]] || die "ZCONNECT_GOST must be an absolute path"
+  [[ -x "$ZCONNECT_GOST" ]] || die "$ZCONNECT_GOST is missing or not executable"
+  [[ "$ZCONNECT_ALLOW_LAN" == "0" || "$ZCONNECT_ALLOW_LAN" == "1" ]] || die "ZCONNECT_ALLOW_LAN must be 0 or 1"
+  [[ "$ZCONNECT_BLOCK_IPV6" == "0" || "$ZCONNECT_BLOCK_IPV6" == "1" ]] || die "ZCONNECT_BLOCK_IPV6 must be 0 or 1"
+  command -v iptables >/dev/null 2>&1 || die "iptables is required"
+  command -v ip >/dev/null 2>&1 || die "the ip command is required"
+  if [[ "$ZCONNECT_BLOCK_IPV6" == "1" ]] && ! have_ip6tables; then
+    die "ip6tables is required when ZCONNECT_BLOCK_IPV6=1"
+  fi
+}
+
+ipt() {
+  iptables -w 5 "$@"
+}
+
+have_ip6tables() {
+  command -v ip6tables >/dev/null 2>&1
+}
+
+ip6t() {
+  have_ip6tables || return 1
+  ip6tables -w 5 "$@"
+}
+
+gost_pid() {
+  local pid cmdline
+  pid="$(cat "$PIDFILE" 2>/dev/null)" || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" || return 1
+  [[ "$cmdline" == *"$ZCONNECT_GOST"* ]] || return 1
+  printf '%s' "$pid"
+}
+
+stop_gost() {
+  local pid
+  if ! pid="$(gost_pid)"; then
+    rm -f "$PIDFILE"
+    return 0
+  fi
+  kill "$pid" 2>/dev/null || true
+  for _ in $(seq 1 30); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+  rm -f "$PIDFILE"
+}
+
+start_gost() {
+  local pid check_port=1
+  if gost_pid >/dev/null; then
+    return 0
+  fi
+
+  if command -v ss >/dev/null 2>&1; then
+    if ss -ltn 2>/dev/null | grep -q ":${ZCONNECT_TPROXY_PORT} "; then
+      echo "error: port ${ZCONNECT_TPROXY_PORT} is already in use" >&2
+      return 1
+    fi
+  else
+    check_port=0
+  fi
+
+  : > "$LOG" || return 1
+  nohup "$ZCONNECT_GOST" \
+    -L "red://0.0.0.0:${ZCONNECT_TPROXY_PORT}?tproxy=true&so_mark=${ZCONNECT_GOST_MARK}" \
+    -L "redu://0.0.0.0:${ZCONNECT_TPROXY_PORT}?ttl=30s&so_mark=${ZCONNECT_GOST_MARK}" \
+    -F "socks5://127.0.0.1:${ZCONNECT_PHONE_PORT}?so_mark=${ZCONNECT_GOST_MARK}" \
+    >> "$LOG" 2>&1 &
+  pid=$!
+  printf '%s\n' "$pid" > "$PIDFILE"
+
+  for _ in $(seq 1 50); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "error: gost exited during startup. Log:" >&2
+      tail -n 20 "$LOG" >&2 || true
+      rm -f "$PIDFILE"
+      return 1
+    fi
+    if (( check_port == 0 )); then
+      sleep 1
+      if ! kill -0 "$pid" 2>/dev/null; then
+        echo "error: gost exited during startup. Log:" >&2
+        tail -n 20 "$LOG" >&2 || true
+        rm -f "$PIDFILE"
+        return 1
+      fi
+      return 0
+    fi
+    if ss -ltn 2>/dev/null | grep -q ":${ZCONNECT_TPROXY_PORT} "; then
+      return 0
+    fi
+    sleep 0.1
+  done
+
+  echo "error: gost did not open port ${ZCONNECT_TPROXY_PORT}. Log:" >&2
+  tail -n 20 "$LOG" >&2 || true
+  stop_gost
+  return 1
+}
+
+remove_rules() {
+  # mangle jumps and chains
+  ipt -t mangle -D OUTPUT -j ZCONNECT_OUT 2>/dev/null || true
+  ipt -t mangle -D PREROUTING -j ZCONNECT_DIV 2>/dev/null || true
+  ipt -t mangle -D PREROUTING -j ZCONNECT_PRE 2>/dev/null || true
+  ipt -t filter -D INPUT -j ZCONNECT_IN 2>/dev/null || true
+
+  ipt -t mangle -F ZCONNECT_OUT 2>/dev/null || true
+  ipt -t mangle -X ZCONNECT_OUT 2>/dev/null || true
+  ipt -t mangle -F ZCONNECT_DIV 2>/dev/null || true
+  ipt -t mangle -X ZCONNECT_DIV 2>/dev/null || true
+  ipt -t mangle -F ZCONNECT_PRE 2>/dev/null || true
+  ipt -t mangle -X ZCONNECT_PRE 2>/dev/null || true
+  ipt -t filter -F ZCONNECT_IN 2>/dev/null || true
+  ipt -t filter -X ZCONNECT_IN 2>/dev/null || true
+
+  # IPv6 block
+  ip6t -t filter -D OUTPUT -j ZCONNECT6_OUT 2>/dev/null || true
+  ip6t -t filter -D FORWARD -j ZCONNECT6_OUT 2>/dev/null || true
+  ip6t -t filter -F ZCONNECT6_OUT 2>/dev/null || true
+  ip6t -t filter -X ZCONNECT6_OUT 2>/dev/null || true
+
+  # Policy routing
+  ip rule del fwmark "$ZCONNECT_MARK" lookup "$ZCONNECT_TABLE" 2>/dev/null || true
+  ip route flush table "$ZCONNECT_TABLE" 2>/dev/null || true
+}
+
+apply_rules() (
+  set -e
+  local net
+
+  # ---------------------------------------------------------------- policy
+  # Pref 100 runs before Tailscale's rules (5210+) and the main table. Only
+  # marked packets match, so the phone always wins for captured traffic even
+  # when another VPN installs a default route.
+  ip rule del fwmark "$ZCONNECT_MARK" lookup "$ZCONNECT_TABLE" 2>/dev/null || true
+  ip rule add fwmark "$ZCONNECT_MARK" lookup "$ZCONNECT_TABLE" pref 100
+  ip route flush table "$ZCONNECT_TABLE" 2>/dev/null || true
+  ip route add local 0.0.0.0/0 dev lo table "$ZCONNECT_TABLE" 2>/dev/null || \
+    ip route add local default dev lo table "$ZCONNECT_TABLE"
+
+  # ------------------------------------------------------- local egress mark
+  ipt -t mangle -N ZCONNECT_OUT
+  ipt -t mangle -A ZCONNECT_OUT -o lo -j RETURN
+  ipt -t mangle -A ZCONNECT_OUT -d 127.0.0.0/8 -j RETURN
+  ipt -t mangle -A ZCONNECT_OUT -d 0.0.0.0/8 -j RETURN
+  ipt -t mangle -A ZCONNECT_OUT -d 169.254.0.0/16 -j RETURN
+  ipt -t mangle -A ZCONNECT_OUT -d 224.0.0.0/4 -j RETURN
+  ipt -t mangle -A ZCONNECT_OUT -d 255.255.255.255/32 -j RETURN
+  # gost's own upstream socket carries this mark and must not be recaptured.
+  ipt -t mangle -A ZCONNECT_OUT -m mark --mark "$ZCONNECT_GOST_MARK" -j RETURN
+  # Replies from the transparent proxy must not be captured again. TCP replies
+  # come from a transparent socket; UDP replies use a per-packet transparent
+  # socket. The source-address check is a second guard for forwarded clients,
+  # whose reply source is the remote destination rather than a local address.
+  ipt -t mangle -A ZCONNECT_OUT -m socket --transparent -j RETURN
+  ipt -t mangle -A ZCONNECT_OUT -m addrtype ! --src-type LOCAL -j RETURN
+  if [[ "$ZCONNECT_ALLOW_LAN" == "1" ]]; then
+    for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+      ipt -t mangle -A ZCONNECT_OUT -d "$net" -j RETURN
+    done
+  fi
+  ipt -t mangle -A ZCONNECT_OUT -p tcp -j MARK --set-mark "$ZCONNECT_MARK"
+  ipt -t mangle -A ZCONNECT_OUT -p udp -j MARK --set-mark "$ZCONNECT_MARK"
+  # Anything that is not TCP or UDP cannot be carried by the SOCKS tunnel.
+  # Dropping it prevents ICMP or raw-IP bypasses.
+  ipt -t mangle -A ZCONNECT_OUT -j DROP
+  ipt -t mangle -A OUTPUT -j ZCONNECT_OUT
+
+  # ------------------------------------------- established transparent sockets
+  ipt -t mangle -N ZCONNECT_DIV
+  ipt -t mangle -A ZCONNECT_DIV -j MARK --set-mark "$ZCONNECT_MARK"
+  ipt -t mangle -A ZCONNECT_DIV -j ACCEPT
+  ipt -t mangle -A PREROUTING -p tcp -m socket -j ZCONNECT_DIV
+  ipt -t mangle -A PREROUTING -p udp -m socket -j ZCONNECT_DIV
+
+  # -------------------------------------------------------------- TPROXY
+  ipt -t mangle -N ZCONNECT_PRE
+  ipt -t mangle -A ZCONNECT_PRE -d 127.0.0.0/8 -j RETURN
+  ipt -t mangle -A ZCONNECT_PRE -d 0.0.0.0/8 -j RETURN
+  ipt -t mangle -A ZCONNECT_PRE -d 169.254.0.0/16 -j RETURN
+  ipt -t mangle -A ZCONNECT_PRE -d 224.0.0.0/4 -j RETURN
+  ipt -t mangle -A ZCONNECT_PRE -d 255.255.255.255/32 -j RETURN
+  ipt -t mangle -A ZCONNECT_PRE -m mark --mark "$ZCONNECT_GOST_MARK" -j RETURN
+  if [[ "$ZCONNECT_ALLOW_LAN" == "1" ]]; then
+    for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+      ipt -t mangle -A ZCONNECT_PRE -d "$net" -j RETURN
+    done
+  fi
+  # New local and forwarded flows. Local output is marked in ZCONNECT_OUT and
+  # routed back through lo, so it reaches this hook too. Established flows were
+  # already handled by ZCONNECT_DIV above.
+  ipt -t mangle -A ZCONNECT_PRE -p tcp \
+    -j TPROXY --on-port "$ZCONNECT_TPROXY_PORT" --tproxy-mark "$ZCONNECT_MARK"
+  ipt -t mangle -A ZCONNECT_PRE -p udp \
+    -j TPROXY --on-port "$ZCONNECT_TPROXY_PORT" --tproxy-mark "$ZCONNECT_MARK"
+  ipt -t mangle -A PREROUTING -j ZCONNECT_PRE
+
+  # Keep the transparent port off the LAN. Only TPROXY-marked packets may reach
+  # it; a direct connection from another host is dropped.
+  ipt -t filter -N ZCONNECT_IN
+  ipt -t filter -A ZCONNECT_IN -p tcp --dport "$ZCONNECT_TPROXY_PORT" \
+    -m mark --mark "$ZCONNECT_MARK" -j RETURN
+  ipt -t filter -A ZCONNECT_IN -p tcp --dport "$ZCONNECT_TPROXY_PORT" -j DROP
+  ipt -t filter -A ZCONNECT_IN -p udp --dport "$ZCONNECT_TPROXY_PORT" \
+    -m mark --mark "$ZCONNECT_MARK" -j RETURN
+  ipt -t filter -A ZCONNECT_IN -p udp --dport "$ZCONNECT_TPROXY_PORT" -j DROP
+  ipt -t filter -A INPUT -j ZCONNECT_IN
+
+  # ----------------------------------------------------------------- IPv6
+  # The tunnel is IPv4 over adb. Blocking IPv6 egress prevents apps from
+  # reaching the normal IPv6 network behind the tunnel's back.
+  if [[ "$ZCONNECT_BLOCK_IPV6" == "1" ]] && have_ip6tables; then
+    ip6t -t filter -N ZCONNECT6_OUT
+    ip6t -t filter -A ZCONNECT6_OUT -o lo -j RETURN
+    ip6t -t filter -A ZCONNECT6_OUT -d ::1/128 -j RETURN
+    ip6t -t filter -A ZCONNECT6_OUT -d fe80::/10 -j RETURN
+    ip6t -t filter -A ZCONNECT6_OUT -d ff00::/8 -j RETURN
+    ip6t -t filter -A ZCONNECT6_OUT -j DROP
+    ip6t -t filter -A OUTPUT -j ZCONNECT6_OUT
+    ip6t -t filter -A FORWARD -j ZCONNECT6_OUT
+  fi
+)
+
+write_state() {
+  local value="$1" pid=""
+  if gost_pid >/dev/null; then
+    pid="$(gost_pid)"
+  fi
+  {
+    printf 'lockdown=%s\n' "$value"
+    printf 'lockdown_gost_pid=%s\n' "$pid"
+    printf 'lockdown_port=%s\n' "$ZCONNECT_TPROXY_PORT"
+    printf 'lockdown_phone_port=%s\n' "$ZCONNECT_PHONE_PORT"
+    printf 'lockdown_mark=%s\n' "$ZCONNECT_MARK"
+    printf 'lockdown_gost_mark=%s\n' "$ZCONNECT_GOST_MARK"
+    printf 'lockdown_allow_lan=%s\n' "$ZCONNECT_ALLOW_LAN"
+    printf 'lockdown_ipv6=%s\n' "$ZCONNECT_BLOCK_IPV6"
+  } > "$STATE.tmp"
+  mv "$STATE.tmp" "$STATE"
+  chmod 0644 "$STATE" 2>/dev/null || true
+}
+
+cmd_apply() {
+  need_root
+  validate
+  mkdir -p "$ZCONNECT_RUN_DIR"
+  chmod 0755 "$ZCONNECT_RUN_DIR"
+
+  # Start from a clean slate so repeated applies are safe.
+  remove_rules
+  stop_gost
+
+  if ! start_gost; then
+    write_state off
+    return 1
+  fi
+
+  # apply_rules is a subshell with errexit enabled, so a failed rule is caught
+  # instead of being silently ignored by the caller's if-condition.
+  set +e
+  apply_rules
+  local rc=$?
+  set -e
+  if (( rc != 0 )); then
+    remove_rules
+    stop_gost
+    write_state off
+    die "could not install the routing rules"
+  fi
+
+  write_state on
+  echo "Mandatory routing active (TCP + UDP, mark ${ZCONNECT_MARK}, port ${ZCONNECT_TPROXY_PORT})."
+}
+
+cmd_cleanup() {
+  need_root
+  mkdir -p "$ZCONNECT_RUN_DIR"
+  chmod 0755 "$ZCONNECT_RUN_DIR"
+  # Remove the redirects before stopping the proxy, so no packet is sent to a
+  # dead transparent port during teardown.
+  remove_rules
+  stop_gost
+  write_state off
+  echo "Mandatory routing removed."
+}
+
+cmd_status() {
+  local active="off" pid=""
+  if gost_pid >/dev/null && ipt -t mangle -C OUTPUT -j ZCONNECT_OUT >/dev/null 2>&1; then
+    active="on"
+    pid="$(gost_pid)"
+  fi
+  printf 'lockdown=%s\n' "$active"
+  printf 'lockdown_gost_pid=%s\n' "$pid"
+  printf 'lockdown_port=%s\n' "$ZCONNECT_TPROXY_PORT"
+  printf 'lockdown_phone_port=%s\n' "$ZCONNECT_PHONE_PORT"
+  printf 'lockdown_mark=%s\n' "$ZCONNECT_MARK"
+  printf 'lockdown_allow_lan=%s\n' "$ZCONNECT_ALLOW_LAN"
+  printf 'lockdown_ipv6=%s\n' "$ZCONNECT_BLOCK_IPV6"
+}
+
+case "${1:-status}" in
+  apply) cmd_apply ;;
+  cleanup) cmd_cleanup ;;
+  status) cmd_status ;;
+  *)
+    echo "usage: $0 {apply|cleanup|status}" >&2
+    exit 2
+    ;;
+esac

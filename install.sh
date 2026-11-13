@@ -65,6 +65,15 @@ if [[ "${EUID:-$(id -u)}" -eq 0 && "$DEST_EXPLICIT" == "0" && -n "${SUDO_USER:-}
   fi
 fi
 
+# `sudo ./install.sh --privileged` from a clone should use the clone itself,
+# not a ~/.local/share/z-connect directory that was never installed.
+if [[ "${EUID:-$(id -u)}" -eq 0 && "$PRIVILEGED" == "1" && \
+      "$DEST_EXPLICIT" == "0" && \
+      ! -f "$DEST/privileged/zconnect-lockdown" && \
+      -f "$SRC/privileged/zconnect-lockdown" ]]; then
+  DEST="$SRC"
+fi
+
 if [[ "${EUID:-$(id -u)}" -eq 0 && "$PRIVILEGED" == "1" ]]; then
   ROOT_ONLY=1
 fi
@@ -82,6 +91,10 @@ privileged_install() {
 
   if [[ ! -f "$DEST/privileged/zconnect-lockdown" ]]; then
     echo "error: privileged/zconnect-lockdown is missing from $DEST." >&2
+    if [[ -f "$SRC/privileged/zconnect-lockdown" ]]; then
+      echo "It is present in $SRC. Run that copy instead:" >&2
+      echo "  \"$SRC/install.sh\" --privileged" >&2
+    fi
     exit 1
   fi
 

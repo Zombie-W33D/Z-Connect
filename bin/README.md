@@ -39,6 +39,6 @@ If `adb` is already installed and in `PATH`, the scripts use it automatically.
 ## Why a desktop gost?
 
 The optional mandatory-routing mode (`install.sh --privileged`) runs gost as a
-root-owned userspace TUN service. That process cannot use the phone copy, so a
-second binary for the desktop architecture is installed to
+root-owned userspace TUN service. That process cannot use the phone copy, so a second
+binary for the desktop architecture is installed to
 `/usr/local/libexec/zconnect-gost`.

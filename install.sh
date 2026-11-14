@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the Phone Tether runtime in place (this directory).
+# Install Z-Connect into ~/.local/share/z-connect.
 #
 #   ./install.sh                  install the user-facing files
 #   ./install.sh --enable         also enable the Omarchy bar widget
@@ -19,12 +19,10 @@
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# The local runtime lives in this directory. Use it in place instead of making
-# a second copy under ~/.local/share.
-DEST="${ZCONNECT_DIR:-$SRC}"
+DEST="${ZCONNECT_DIR:-$HOME/.local/share/z-connect}"
 DEST_EXPLICIT=0
 [[ -n "${ZCONNECT_DIR:-}" ]] && DEST_EXPLICIT=1
-PLUGIN_ID="zombie.phone-tether"
+PLUGIN_ID="zconnect.phone-tether"
 PLUGIN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/$PLUGIN_ID"
 HELPER="/usr/local/libexec/zconnect-lockdown"
 HELPER_GOST="/usr/local/libexec/zconnect-gost"
@@ -67,8 +65,8 @@ if [[ "${EUID:-$(id -u)}" -eq 0 && "$DEST_EXPLICIT" == "0" && -n "${SUDO_USER:-}
   fi
 fi
 
-# `sudo ./install.sh --privileged` should use the directory the script lives in
-# when the inferred install has no runtime files.
+# `sudo ./install.sh --privileged` from a clone should use the clone itself,
+# not a ~/.local/share/z-connect directory that was never installed.
 if [[ "${EUID:-$(id -u)}" -eq 0 && "$PRIVILEGED" == "1" && \
       "$DEST_EXPLICIT" == "0" && \
       ! -f "$DEST/privileged/zconnect-lockdown" && \
@@ -193,10 +191,7 @@ if [[ "$SRC" != "$DEST" ]]; then
         "$SRC"/lockdown.sh "$SRC"/env.sh "$SRC"/lib.sh \
         "$SRC"/fetch-deps.sh \
         "$SRC"/chromium-zconnect.sh "$SRC"/brave-zconnect.sh \
-        "$SRC"/README.md "$DEST"/
-  if [[ -f "$SRC/LICENSE" ]]; then
-    cp -a "$SRC/LICENSE" "$DEST"/
-  fi
+        "$SRC"/README.md "$SRC"/LICENSE "$DEST"/
   mkdir -p "$DEST/docs" "$DEST/bin" "$DEST/omarchy" "$DEST/privileged"
   cp -a "$SRC"/docs/. "$DEST/docs"/
   cp -a "$SRC"/bin/. "$DEST/bin"/
@@ -222,13 +217,9 @@ if [[ "$PRIVILEGED" == "1" ]]; then
 fi
 
 # ------------------------------------------------------------------ bar widget
-if [[ -d "$DEST/omarchy/$PLUGIN_ID" ]]; then
-  echo "Installing the Omarchy widget to $PLUGIN_DIR"
-  mkdir -p "$PLUGIN_DIR"
-  cp -a "$DEST"/omarchy/"$PLUGIN_ID"/. "$PLUGIN_DIR"/
-else
-  echo "warning: widget files are not present in $DEST/omarchy/$PLUGIN_ID; skipping the widget." >&2
-fi
+echo "Installing the Omarchy widget to $PLUGIN_DIR"
+mkdir -p "$PLUGIN_DIR"
+cp -a "$DEST"/omarchy/"$PLUGIN_ID"/. "$PLUGIN_DIR"/
 
 if [[ -x "$DEST/bin/adb" && -x "$DEST/bin/gost" && -x "$DEST/bin/gost-desktop" ]]; then
   echo "Bundled adb and gost binaries are present."
@@ -238,7 +229,7 @@ else
   echo "  cd \"$DEST\" && ./fetch-deps.sh"
 fi
 
-if [[ "$ENABLE" == "1" && -d "$DEST/omarchy/$PLUGIN_ID" ]]; then
+if [[ "$ENABLE" == "1" ]]; then
   if command -v omarchy >/dev/null 2>&1; then
     echo
     echo "Enabling the widget..."
@@ -247,8 +238,6 @@ if [[ "$ENABLE" == "1" && -d "$DEST/omarchy/$PLUGIN_ID" ]]; then
   else
     echo "warning: the omarchy command was not found; enable the widget from the shell settings." >&2
   fi
-elif [[ "$ENABLE" == "1" ]]; then
-  echo "warning: --enable was requested, but the widget files are missing." >&2
 else
   echo
   echo "To enable the widget:"

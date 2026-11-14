@@ -66,9 +66,10 @@ dead proxy. Reconnecting flips it back to the phone.
 - **User-level system proxy.** Connect can point GNOME/GIO apps and newly
   launched Hyprland apps at the stable relay, with no root. It can start at
   login, stays on across phone disconnects, and falls back to direct mode.
-- **Optional mandatory routing.** A one-time privileged install adds transparent
-  TCP + UDP capture with TPROXY, so apps that ignore proxy settings still use
-  the phone. No app can silently bypass the tunnel while it is enabled.
+- **Optional mandatory routing.** A one-time privileged install adds a
+  userspace TUN that captures every IPv4 TCP and UDP flow, so apps that ignore
+  proxy settings still use the phone. No app can silently bypass the tunnel
+  while it is enabled.
 - **One-command setup and teardown.** `connect.sh`, `disconnect.sh`, and a
   machine-readable `status.sh`.
 - **Omarchy bar widget.** Phone icon, green/amber state dot, Connect and
@@ -172,21 +173,24 @@ This is a user-level proxy, not a VPN. It does not change routes and does not
 capture apps that ignore both `gsettings` and the Chromium SOCKS variables. Use
 mandatory routing for those.
 
-### 6. Optional mandatory routing (TPROXY)
+### 6. Optional mandatory routing (TUN)
 
 The system proxy is cooperative: an app can ignore it and keep using the normal
 network. Mandatory routing closes that gap.
 
 `install.sh --privileged` installs a root-owned helper once. After that,
 `lockdown.sh enable` (or the panel toggle, or `connect.sh` automatically) starts
-a root-owned gost process as a transparent TCP and UDP proxy and installs:
+a root-owned gost process that creates a userspace TUN and installs:
 
-- an `iptables` mangle chain that marks all local TCP/UDP output,
-- a policy route that sends marked packets to a local TPROXY listener,
-- a `DIVERT` rule so established transparent sockets keep working,
-- LAN, loopback, link-local, and multicast exclusions,
-- a final drop for protocols the SOCKS tunnel cannot carry,
+- policy rules that send every IPv4 destination into the TUN, while loopback,
+  link-local, multicast, broadcast, and (by default) LAN ranges stay local,
+- a TUN default route in its own table, leaving the normal default route
+  untouched,
 - an IPv6 block, because the tunnel itself is IPv4.
+
+gost's `tungo` handler runs tun2socks in userspace: it terminates each TCP and
+UDP flow and forwards it through the phone's SOCKS5 server. ICMP and other
+non-TCP/UDP protocols are delivered to the TUN and dropped.
 
 While mandatory routing is on, every app on the desktop uses the phone,
 including games, daemons, and apps with their own network stack. There is no
@@ -204,7 +208,7 @@ The helper is the only command allowed through a restricted sudoers entry:
 /usr/local/libexec/zconnect-lockdown apply|cleanup|status
 ```
 
-All ports, marks, and paths come from a root-owned
+All ports, interface names, and paths come from a root-owned
 `/etc/zconnect/lockdown.conf`, never from the caller.
 
 If you use Tailscale, WireGuard, Docker, or another overlay, review
@@ -225,7 +229,7 @@ traffic too, and IPv6 is blocked.
 - Optional: GNOME/GIO `gsettings` and a Hyprland session for the user-level
   system proxy.
 - Optional: systemd user services for boot-time proxying.
-- Optional: `iptables`, `ip`, and root for mandatory routing.
+- Optional: `ip`, `ip6tables`, and root for mandatory routing.
 - Optional: Omarchy with the Quickshell-based shell, for the bar widget.
 
 ### Phone
@@ -442,7 +446,7 @@ Mandatory routing is the "no app can bypass the phone" mode:
 ```bash
 ./lockdown.sh status   # key=value state
 ./lockdown.sh enable   # all TCP and UDP through the phone
-./lockdown.sh disable  # remove the rules, restore normal routing
+./lockdown.sh disable  # remove the TUN route, restore normal routing
 ./lockdown.sh cleanup  # disable when the phone tunnel is down
 ```
 
@@ -486,9 +490,10 @@ system_proxy_service=active
 lockdown=on
 lockdown_helper=installed
 lockdown_gost_pid=12345
-lockdown_port=12345
+lockdown_tun=zconnect0
+lockdown_port=
 lockdown_phone_port=1081
-lockdown_mark=9011
+lockdown_mark=
 lockdown_allow_lan=1
 lockdown_ipv6=1
 lockdown_udp=yes
@@ -812,7 +817,7 @@ Z-Connect/
 ├── lib.sh                     # shared shell helpers
 ├── bin/README.md              # binary download notes
 ├── privileged/
-│   └── zconnect-lockdown      # root-owned TPROXY helper
+│   └── zconnect-lockdown      # root-owned TUN helper
 ├── omarchy/
 │   └── zconnect.phone-tether/
 │       ├── manifest.json

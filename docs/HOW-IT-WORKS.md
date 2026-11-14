@@ -273,8 +273,8 @@ It also emits the relay state (`relay_running`, `relay_pid`, `relay_mode`,
 `system_proxy_mode`, `system_proxy_socks`, `system_proxy_error`,
 `system_proxy_boot`, `system_proxy_env_file`, `system_proxy_service`), and the
 mandatory-routing state (`lockdown`, `lockdown_helper`, `lockdown_gost_pid`,
-`lockdown_port`, `lockdown_phone_port`, `lockdown_mark`, `lockdown_allow_lan`,
-`lockdown_ipv6`, `lockdown_udp`) before the phone checks. The panel uses this to
+`lockdown_tun`, `lockdown_port`, `lockdown_phone_port`, `lockdown_mark`,
+`lockdown_allow_lan`, `lockdown_ipv6`, `lockdown_udp`) before the phone checks. The panel uses this to
 recover after a crash or cable pull.
 
 The script deliberately exits 0 even when the phone is missing, because the bar
@@ -453,23 +453,29 @@ routing covers those apps when it is installed.
 
 ---
 
-## 8. Mandatory routing (TPROXY)
+## 8. Mandatory routing (TUN)
 
 The user-level proxy is cooperative. Mandatory routing makes the kernel capture
 the traffic instead, so an app cannot bypass the phone by ignoring proxy
 settings.
 
-### Why TPROXY
+### Why a TUN
 
 The desktop needs transparent TCP **and UDP** capture. Options considered:
 
-- **TUN/TUNGO or sing-box TUN** — a virtual interface captures everything, but
-  it needs root, an interface, and careful route management. More moving parts.
-- **REDIRECT** — iptables-only, but TCP only.
-- **TPROXY** — mangle marking plus policy routing. Supports TCP and UDP, works
-  with the existing gost chain, and is well documented by gost.
+- **TPROXY** — mangle marking plus policy routing. It captures forwarded traffic,
+  but on current kernels a mark set in the `OUTPUT` hook does not reroute an
+  already-resolved local socket, so locally generated desktop traffic keeps
+  using the normal interface.
+- **REDIRECT** — iptables-only. TCP preserves the original destination, but UDP
+  REDIRECT rewrites the destination before the socket receives it, so the proxy
+  cannot recover the original target.
+- **TUN** — a virtual interface captures every IPv4 packet. gost's `tungo`
+  handler runs tun2socks in userspace, terminates TCP and UDP, and forwards each
+  flow through the existing SOCKS5 chain. This handles both protocols without
+  conntrack tricks and leaves the normal default route untouched.
 
-Z-Connect uses TPROXY.
+Z-Connect uses a TUN.
 
 ### Components
 
@@ -484,29 +490,27 @@ On `apply` it:
    (`/usr/local/libexec/zconnect-gost`) with:
 
    ```text
-   -L red://0.0.0.0:12345?tproxy=true&so_mark=9012
-   -L redu://0.0.0.0:12345?ttl=30s&so_mark=9012
-   -F socks5://127.0.0.1:1081?so_mark=9012
+   -L tungo://:0?name=zconnect0&net=198.18.0.1/15&mtu=1400
+   -F socks5://127.0.0.1:1081
    ```
 
-   The `so_mark` option marks gost's outbound sockets, so its connection to the
-   phone-side SOCKS server is not captured by the local-output rules. Binding to
-   `0.0.0.0` keeps the transparent listener IPv4-only; the IPv6 side is blocked.
+   `tungo` creates the TUN device, assigns the address, and runs tun2socks. The
+   `-F socks5://127.0.0.1:1081` chain carries TCP CONNECT and gost's `0xF3`
+   UDP-over-TCP extension across the adb forward. gost's own connection to the
+   phone is loopback, so it is never captured by the TUN.
 
-2. adds `ip rule fwmark 9011 lookup 9011 pref 100` and a local default route in
-   table 9011, so marked packets are delivered to the local TPROXY listener. The
-   low preference keeps the phone ahead of Tailscale and other VPN rules that
-   might install a competing default route;
-3. marks all local TCP and UDP output with `9011`, except loopback, link-local,
-   multicast, LAN ranges, gost's own marked sockets, and replies from the
-   transparent proxy (whose source address is not a local address);
-4. adds a `DIVERT` rule using `-m socket` so established transparent sockets are
-   marked and accepted instead of being re-proxied;
-5. adds a TPROXY rule for new local and forwarded TCP and UDP, excluding gost's
-   own marked traffic;
-6. drops any local protocol that is not TCP or UDP, so ICMP and raw-IP cannot
-   bypass the tunnel;
-7. blocks IPv6 egress in both `OUTPUT` and `FORWARD`.
+2. adds policy rules at preference 9000-9010. Loopback, link-local, multicast,
+   broadcast, `0.0.0.0/8`, and (by default) the private LAN ranges stay on the
+   normal table. All other IPv4 traffic looks up table 9010, whose default route
+   is the TUN. The normal default route in the main table is not modified.
+3. sets `rp_filter=0` on the TUN only. tun2socks writes replies back with the
+   remote address as the source, which strict reverse-path filtering would
+   otherwise drop.
+4. points systemd-resolved at the TUN (`resolvectl dns` and a `~.` routing
+   domain) when `resolvectl` is available, so DNS also uses the phone. On
+   cleanup the per-link setting is reverted.
+5. blocks IPv6 egress in both `OUTPUT` and `FORWARD`, because the tunnel carries
+   IPv4 only.
 
 The helper writes a world-readable state file at
 `/run/zconnect/lockdown.state` so `lockdown.sh status` and the panel can report
@@ -528,8 +532,14 @@ the state without sudo.
 - **Root is required.** There is no rootless way to capture the whole desktop.
 - **Everything is captured.** Tailscale, WireGuard, Docker, and other overlays
   are affected while the mode is on. Turn it off when you need them.
+- **Existing connections keep their route.** A socket that connected before the
+  mode was enabled has already cached its route; new connections from the same
+  app use the TUN immediately.
 - **IPv6 is blocked.** The tunnel is IPv4 over adb.
-- **Non-TCP/UDP is dropped.** ICMP and raw sockets cannot cross the tunnel.
+- **ICMP does not cross the tunnel.** Ping and other non-TCP/UDP protocols are
+  delivered to the TUN and dropped; TCP and UDP are unaffected.
+- **The LAN is excluded by default.** `ZCONNECT_ALLOW_LAN=0` sends even private
+  ranges through the phone.
 
 ---
 
@@ -540,7 +550,7 @@ the state without sudo.
 | Desktop reboot | Phone-side gost may still run; `bin/` files; boot units re-apply the proxy | `adb` server and forward are gone; the relay restarts from its unit |
 | Unplug/replug phone | Phone-side gost may still run; relay falls back to direct | `adb` forward is gone |
 | Unplug while system proxy is on | The saved proxy backup; the relay in direct mode | `proxy.sh cleanup` removes mandatory routing; the proxy stays on and uses the normal network |
-| Unplug while mandatory routing is on | The saved proxy backup | Transparent rules are removed by cleanup; without cleanup, traffic is pinned to a dead phone |
+| Unplug while mandatory routing is on | The saved proxy backup | The TUN route is removed by cleanup; without cleanup, traffic is pinned to a dead phone |
 | Phone reboot | Nothing on the phone side | `gost` process and forward are gone |
 | `disconnect.sh` | Binaries, scripts, and the relay in direct mode | gost process and forward are gone; mandatory routing is removed; the proxy stays on unless `--proxy-off` |
 | `adb kill-server` | Phone-side gost; the relay in direct mode | Forward is gone |
@@ -557,9 +567,9 @@ recreates the forward, and sets the relay back to phone mode.
 - A SOCKS5 relay listener on the **desktop's** `127.0.0.1:1080`.
 - An `adb` forward on the **desktop's** `127.0.0.1:1081`.
 - A SOCKS5 listener on the **phone's** `127.0.0.1:1081`.
-- In mandatory mode, a TPROXY listener on port `12345`. The helper's filter
-  rules drop direct connections to it unless the packet carries the expected
-  mark, so it is not usable from the LAN.
+- In mandatory mode, a userspace TUN device (`zconnect0`) owned by the root
+  gost process. It has no listening socket; the only network endpoint remains
+  the loopback SOCKS server.
 
 None of these listeners is bound to a LAN interface. An attacker on the same
 Wi-Fi or ethernet network cannot connect to any of them. Access requires either
@@ -627,8 +637,8 @@ desktop cannot use it.
 Useful for transparent whole-desktop routing, but requires root and more moving
 parts. Z-Connect's user-level system proxy covers GNOME/GIO apps and
 Chromium-based apps without root. For apps that ignore both, Z-Connect now ships
-an optional TPROXY mode with a restricted helper, which is lighter than adding a
-TUN interface and a second proxy stack.
+an optional TUN mode with a restricted helper. It reuses the same gost binary
+and SOCKS chain, so there is no second proxy stack to install.
 
 ### SSH reverse tunnel
 
@@ -644,7 +654,7 @@ standard on Android) and more setup. `gost` + `adb` is lighter.
 | SOCKS5 instead of a TUN device | No root; simple; works with common apps | Per-app configuration; not system-wide on its own |
 | Stable local relay | Apps keep one proxy setting and switch routes without a restart | One extra user-level process |
 | User-level system proxy | No root; GNOME/GIO and Chromium apps work; can start at login | Not a VPN; apps that were direct need one restart; apps with their own proxy config may ignore it |
-| Optional TPROXY mode | Every app, including UDP, uses the phone; no bypass | Requires root; captures overlays too; blocks IPv6 and non-TCP/UDP |
+| Optional TUN mode | Every app, including UDP, uses the phone; no bypass | Requires root; captures overlays too; blocks IPv6 and ICMP |
 | gost on the phone | Avoids tethering stack; static binary; TCP + UDP | Must match phone ABI; process must be started over ADB |
 | `adb forward` | No extra network listener; USB-only | Forward does not survive unplug/reboot |
 | Remote DNS | Works with no desktop DNS | Requires `socks5h`-aware clients |

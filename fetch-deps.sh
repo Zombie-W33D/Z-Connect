@@ -3,7 +3,7 @@
 #
 #   bin/adb           Android platform-tools (Linux desktop)
 #   bin/gost          gost proxy, built for the phone (ARM64 by default)
-#   bin/gost-desktop  gost proxy, built for this desktop (used by TPROXY)
+#   bin/gost-desktop  gost proxy, built for this desktop (used by the TUN helper)
 #
 # Nothing is installed system-wide. Run this once after cloning.
 set -euo pipefail
@@ -21,7 +21,7 @@ CHECKSUMS_URL="${GOST_BASE}/checksums.txt"
 PLATFORM_TOOLS_URL="https://dl.google.com/android/repository/platform-tools-latest-linux.zip"
 
 # The phone is almost always ARM64. The desktop binary must match this host so
-# the privileged TPROXY helper can execute it.
+# the privileged TUN helper can execute it.
 PHONE_ASSET="${GOST_PHONE_ASSET:-gost_${GOST_RELEASE}_linux_arm64.tar.gz}"
 case "$(uname -m)" in
   x86_64|amd64) HOST_ARCH="amd64" ;;

@@ -7,7 +7,7 @@ repository:
 | --- | --- | --- |
 | `bin/adb` | Android Debug Bridge on the desktop | [Android platform-tools](https://developer.android.com/tools/releases/platform-tools) |
 | `bin/gost` | SOCKS5 proxy pushed to the phone (TCP + UDP) | [go-gost/gost releases](https://github.com/go-gost/gost/releases) |
-| `bin/gost-desktop` | Desktop gost used by the optional TPROXY helper | [go-gost/gost releases](https://github.com/go-gost/gost/releases) |
+| `bin/gost-desktop` | Desktop gost used by the optional TUN helper | [go-gost/gost releases](https://github.com/go-gost/gost/releases) |
 
 Run this once after cloning:
 
@@ -39,6 +39,6 @@ If `adb` is already installed and in `PATH`, the scripts use it automatically.
 ## Why a desktop gost?
 
 The optional mandatory-routing mode (`install.sh --privileged`) runs gost as a
-root-owned TPROXY service. That process cannot use the phone copy, so a second
-binary for the desktop architecture is installed to
+root-owned userspace TUN service. That process cannot use the phone copy, so a
+second binary for the desktop architecture is installed to
 `/usr/local/libexec/zconnect-gost`.

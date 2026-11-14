@@ -58,6 +58,7 @@ else
   emit lockdown off
   emit lockdown_helper missing
   emit lockdown_gost_pid ""
+  emit lockdown_tun ""
   emit lockdown_port ""
   emit lockdown_phone_port ""
   emit lockdown_mark ""

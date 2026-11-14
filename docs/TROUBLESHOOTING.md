@@ -150,9 +150,10 @@ source ./env.sh
 
 `ZCONNECT_PHONE_PORT` defaults to the relay port plus one.
 
-Mandatory routing also uses TCP/UDP port `12345` for TPROXY. If that port is in
-use, change `ZCONNECT_TPROXY_PORT` before running `install.sh --privileged`
-(the helper reads it from `/etc/zconnect/lockdown.conf`).
+Mandatory routing creates a TUN device named `zconnect0` and policy-routing
+table `9010`. If either name is already in use, set `ZCONNECT_TUN_NAME` or
+`ZCONNECT_TUN_TABLE` before running `install.sh --privileged` (the helper reads
+them from `/etc/zconnect/lockdown.conf`).
 
 ---
 
@@ -278,8 +279,8 @@ switches new connections to the normal network, so apps that use it keep working
 The system proxy deliberately stays on and now uses the normal network through
 the relay.
 
-If mandatory routing was on, its transparent rules must be removed, because they
-would otherwise pin all traffic to a dead phone:
+If mandatory routing was on, its TUN route must be removed, because it would
+otherwise pin all traffic to a dead phone:
 
 ```bash
 cd ~/.local/share/z-connect
@@ -423,9 +424,11 @@ Common causes:
   `bin/gost-desktop`; run `./fetch-deps.sh` first.
 - **sudo asks for a password.** The restricted sudoers entry is missing or names
   a different user. Reinstall the helper from the same account you use.
-- **`iptables` missing.** Install your distribution's `iptables` package.
+- **`ip6tables` missing.** Install your distribution's `ip6tables` package, or
+  set `ZCONNECT_BLOCK_IPV6=0` before `install.sh --privileged`.
 - **gost fails to start.** Read `/run/zconnect/gost.log`. The usual cause is
-  that the phone tunnel is not up, or another process owns port `12345`.
+  that the phone tunnel is not up, or the TUN device `zconnect0` is already in
+  use by another process.
 - **IPv6 is blocked and something broke.** That is expected. Disable mandatory
   routing while you need IPv6 or an overlay.
 

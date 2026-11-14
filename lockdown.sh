@@ -2,8 +2,8 @@
 # Enable or disable mandatory system-wide routing through the phone.
 #
 # This is the "no app can bypass the tunnel" mode. It uses a root-owned helper
-# that runs gost as a transparent TCP/UDP proxy and installs the iptables and
-# policy-routing rules. The helper is installed once with:
+# that runs gost as a userspace TUN and policy-routes all IPv4 traffic into it.
+# The helper is installed once with:
 #
 #   ./install.sh --privileged
 #
@@ -109,9 +109,9 @@ cmd_disable() {
 
 cmd_cleanup() {
   lockdown_state_on || return 0
-  # If the phone-side tunnel is gone, the transparent rules would strand the
-  # desktop: every connection would be sent to a proxy that cannot answer.
-  # Remove them even when adb still sees the phone.
+  # If the phone-side tunnel is gone, the TUN route would strand the desktop:
+  # every connection would be sent to a proxy that cannot answer. Remove it
+  # even when adb still sees the phone.
   if zconnect_tunnel_up; then
     echo "Mandatory routing stays on because the phone tunnel is still up."
     return 0
@@ -120,14 +120,13 @@ cmd_cleanup() {
 }
 
 cmd_status() {
-  local helper="missing" lock="off" pid="" port="" mark="" phone_port="" ipv6="" lan=""
+  local helper="missing" lock="off" pid="" tun="" phone_port="" ipv6="" lan=""
 
   helper_installed && helper="installed"
   if lockdown_on; then
     lock="on"
     pid="$(state_pid 2>/dev/null || true)"
-    port="$(read_state lockdown_port 2>/dev/null || true)"
-    mark="$(read_state lockdown_mark 2>/dev/null || true)"
+    tun="$(read_state lockdown_tun 2>/dev/null || true)"
     phone_port="$(read_state lockdown_phone_port 2>/dev/null || true)"
     ipv6="$(read_state lockdown_ipv6 2>/dev/null || true)"
     lan="$(read_state lockdown_allow_lan 2>/dev/null || true)"
@@ -136,9 +135,10 @@ cmd_status() {
   emit lockdown "$lock"
   emit lockdown_helper "$helper"
   emit lockdown_gost_pid "$pid"
-  emit lockdown_port "$port"
+  emit lockdown_tun "$tun"
+  emit lockdown_port ""
   emit lockdown_phone_port "$phone_port"
-  emit lockdown_mark "$mark"
+  emit lockdown_mark ""
   emit lockdown_allow_lan "$lan"
   emit lockdown_ipv6 "$ipv6"
   emit lockdown_udp yes
